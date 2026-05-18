@@ -367,13 +367,24 @@ class WebViewEngine : BrowserEngine {
     }.ifEmpty { "ssl error" }
 
     companion object {
-        // Pre-page JS shim that wraps console.* and global error/unhandledrejection,
-        // forwarding everything to native via __devbrowser_dbg.post(level,text,src,line).
-        // Stays passive if the bridge is missing (e.g. before injection).
+        /**
+         * Pre-page JS shim. Acts as a CDP substitute when the real CDP socket
+         * is unreachable (every Samsung WebView build the author has seen).
+         * Hooks:
+         *   - console.{log,info,warn,error,debug,trace}
+         *   - window 'error' + 'unhandledrejection'
+         *   - fetch / XMLHttpRequest / WebSocket  → Network mirror
+         *   - 3 health checks at +1s/+3s/+8s reporting DOM root state
+         *
+         * All callbacks post to native via __devbrowser_dbg, which is a
+         * top-level public class registered as a JavascriptInterface so
+         * Android's reflection always finds the methods.
+         */
         private val DBG_SHIM_JS = """
         (function(){
           if (window.__devbrowser_shim_installed) return;
           window.__devbrowser_shim_installed = true;
+          var origin = location.href;
           function bridge(){ return window.__devbrowser_dbg; }
           function stringify(arg){
             try {
@@ -387,32 +398,131 @@ class WebViewEngine : BrowserEngine {
               return String(arg);
             } catch(e){ return '[unserialisable]'; }
           }
+          function emit(level, text){
+            try { var b = bridge(); if (b) b.post(level, text, location.href, -1); } catch(e){}
+          }
+
+          // ── console.* hooks ─────────────────────────────────────────────
           ['log','info','warn','error','debug','trace'].forEach(function(name){
             var orig = console[name] ? console[name].bind(console) : function(){};
             console[name] = function(){
               var args = Array.prototype.slice.call(arguments);
-              var text = args.map(stringify).join(' ');
-              try { var b = bridge(); if (b) b.post(name, text, location.href, -1); } catch(e){}
+              emit(name, args.map(stringify).join(' '));
               return orig.apply(console, args);
             };
           });
+
+          // ── global error / promise hooks ────────────────────────────────
           window.addEventListener('error', function(ev){
-            try {
-              var b = bridge();
-              if (b) {
-                var msg = (ev.error && ev.error.stack) ? ev.error.stack
-                    : (ev.message + ' at ' + (ev.filename||'?') + ':' + (ev.lineno||0));
-                b.post('error', msg, ev.filename || location.href, ev.lineno|0);
-              }
-            } catch(e){}
+            var b = bridge(); if (!b) return;
+            var msg;
+            if (ev.error && ev.error.stack) msg = ev.error.stack;
+            else if (ev.target && (ev.target.tagName === 'SCRIPT' || ev.target.tagName === 'LINK' || ev.target.tagName === 'IMG')) {
+              msg = 'Resource load FAILED: <' + ev.target.tagName.toLowerCase() + '> ' + (ev.target.src || ev.target.href || '');
+            } else {
+              msg = (ev.message||'error') + ' at ' + (ev.filename||'?') + ':' + (ev.lineno||0);
+            }
+            try { b.post('error', msg, ev.filename || location.href, ev.lineno|0); } catch(e){}
           }, true);
           window.addEventListener('unhandledrejection', function(ev){
-            try {
-              var b = bridge();
-              if (b) b.post('error', 'Unhandled rejection: ' + stringify(ev.reason),
-                            location.href, -1);
-            } catch(e){}
+            emit('error', 'Unhandled rejection: ' + stringify(ev.reason));
           }, true);
+
+          // ── fetch hook ──────────────────────────────────────────────────
+          if (window.fetch) {
+            var _fetch = window.fetch.bind(window);
+            window.fetch = function(input, init){
+              var url = (typeof input === 'string') ? input :
+                        (input && input.url) ? input.url : String(input);
+              var method = (init && init.method) || (input && input.method) || 'GET';
+              var t0 = Date.now();
+              emit('debug', '↗ fetch ' + method + ' ' + url);
+              return _fetch(input, init).then(function(resp){
+                emit(resp.ok ? 'debug' : 'warn',
+                  '↙ fetch ' + resp.status + ' ' + url + ' (' + (Date.now()-t0) + 'ms)');
+                return resp;
+              }, function(err){
+                emit('error', '✗ fetch FAILED ' + url + ': ' + (err && err.message));
+                throw err;
+              });
+            };
+          }
+
+          // ── XMLHttpRequest hook ─────────────────────────────────────────
+          if (window.XMLHttpRequest) {
+            var XHR = window.XMLHttpRequest;
+            var _open = XHR.prototype.open;
+            var _send = XHR.prototype.send;
+            XHR.prototype.open = function(method, url){
+              this.__dbg_meta = { method: method, url: url, t0: 0 };
+              return _open.apply(this, arguments);
+            };
+            XHR.prototype.send = function(){
+              var m = this.__dbg_meta || {};
+              m.t0 = Date.now();
+              var self = this;
+              emit('debug', '↗ xhr ' + (m.method||'GET') + ' ' + (m.url||''));
+              this.addEventListener('load', function(){
+                emit(self.status >= 400 ? 'warn' : 'debug',
+                  '↙ xhr ' + self.status + ' ' + (m.url||'') + ' (' + (Date.now()-m.t0) + 'ms)');
+              });
+              this.addEventListener('error', function(){
+                emit('error', '✗ xhr FAILED ' + (m.url||''));
+              });
+              this.addEventListener('timeout', function(){
+                emit('error', '⏱ xhr TIMEOUT ' + (m.url||''));
+              });
+              return _send.apply(this, arguments);
+            };
+          }
+
+          // ── WebSocket hook ──────────────────────────────────────────────
+          if (window.WebSocket) {
+            var _WS = window.WebSocket;
+            window.WebSocket = function(url, protocols){
+              emit('debug', '↗ ws connect ' + url);
+              var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
+              ws.addEventListener('open', function(){ emit('info', '✓ ws open ' + url); });
+              ws.addEventListener('close', function(ev){ emit('debug', '✕ ws close ' + url + ' (code=' + ev.code + ' reason="' + (ev.reason||'') + '")'); });
+              ws.addEventListener('error', function(){ emit('error', '✗ ws error ' + url); });
+              return ws;
+            };
+            window.WebSocket.prototype = _WS.prototype;
+            window.WebSocket.CONNECTING = 0;
+            window.WebSocket.OPEN = 1;
+            window.WebSocket.CLOSING = 2;
+            window.WebSocket.CLOSED = 3;
+          }
+
+          // ── DOM health checks ───────────────────────────────────────────
+          function snapshot(label){
+            try {
+              var roots = ['root','app','main','__next','__nuxt'];
+              var found = null;
+              for (var i = 0; i < roots.length; i++) {
+                var el = document.getElementById(roots[i]);
+                if (el) { found = { id: roots[i], el: el }; break; }
+              }
+              if (!found && document.body && document.body.children.length > 0) {
+                found = { id: document.body.children[0].tagName.toLowerCase(), el: document.body.children[0] };
+              }
+              var body = document.body;
+              var info = label + ': readyState=' + document.readyState +
+                ', title="' + document.title + '"' +
+                ', bodyChildren=' + (body ? body.children.length : 0) +
+                ', bodyTextLen=' + (body ? (body.innerText||'').length : 0);
+              if (found) {
+                info += ', mount[#' + found.id + ']={children:' + found.el.children.length +
+                  ', innerHTML.length:' + found.el.innerHTML.length + '}';
+              } else {
+                info += ', NO MOUNT POINT';
+              }
+              emit('info', info);
+            } catch(e){ emit('error', 'snapshot failed: ' + e); }
+          }
+          setTimeout(function(){ snapshot('⏱ T+1s'); }, 1000);
+          setTimeout(function(){ snapshot('⏱ T+3s'); }, 3000);
+          setTimeout(function(){ snapshot('⏱ T+8s'); }, 8000);
         })();
         """.trimIndent()
     }
