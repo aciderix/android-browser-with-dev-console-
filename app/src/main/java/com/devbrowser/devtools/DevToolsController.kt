@@ -5,6 +5,7 @@ import com.devbrowser.devtools.cdp.jsonParams
 import com.devbrowser.engine.BrowserEngine
 import com.devbrowser.engine.CdpEndpoint
 import com.devbrowser.engine.NativeEvent
+import com.devbrowser.engine.WebViewEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,13 +77,13 @@ class DevToolsController(
         } as? CdpEndpoint.UnixSocket
         if (endpoint == null) {
             _status.value = Status.Unsupported
-            _diagnostics.value = "No CDP socket reachable. " +
-                "Falling back to native + injected JS console capture."
+            val report = (engine as? WebViewEngine)?.lastProbeReport?.value.orEmpty()
+            val reportLines = if (report.isEmpty()) "(no candidates probed)"
+            else report.joinToString("\n") { "  ${it.first} → ${it.second}" }
+            _diagnostics.value = "CDP unreachable. Tried ${report.size} sockets."
             console.appendNative(
                 ConsoleEntry.Level.Warn,
-                "CDP unavailable on this device. Console capture is using the " +
-                    "native + JS-shim fallback. All console.* calls and uncaught " +
-                    "errors will still appear here.",
+                "CDP unavailable. Native+shim fallback active. Probed sockets:\n$reportLines",
                 null, null,
             )
             return

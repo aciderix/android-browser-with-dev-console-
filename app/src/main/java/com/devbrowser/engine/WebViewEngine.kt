@@ -13,7 +13,6 @@ import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.JsResult
-import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
@@ -104,22 +103,31 @@ class WebViewEngine : BrowserEngine {
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
-            // JS bridge for the pre-page shim. addJavascriptInterface is required
-            // for the shim to call back; the interface only accepts strings and
-            // never reflects them to the page.
-            addJavascriptInterface(DbgBridge(), "__devbrowser_dbg")
+            // JS bridge for the pre-page shim. Must be a top-level public class
+            // for Android's reflection-based JS bridge to find the @JavascriptInterface
+            // methods on every WebView build.
+            addJavascriptInterface(DbgBridge(_nativeEvents), "__devbrowser_dbg")
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 WebViewCompat.addDocumentStartJavaScript(this, DBG_SHIM_JS, setOf("*"))
             }
 
             webViewClient = object : WebViewClient() {
+                private var pageStartMs: Long = 0L
                 override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                    pageStartMs = System.currentTimeMillis()
                     _state.value = _state.value.copy(
                         url = url,
                         isLoading = true,
                         progress = 0,
                         canGoBack = view.canGoBack(),
                         canGoForward = view.canGoForward(),
+                    )
+                    _nativeEvents.tryEmit(
+                        NativeEvent.Console(
+                            NativeEvent.Console.Level.Info,
+                            "→ Loading: $url",
+                            url, null,
+                        )
                     )
                     // On older webview builds without DOCUMENT_START_SCRIPT, inject
                     // the shim manually as soon as the document begins parsing.
@@ -137,6 +145,28 @@ class WebViewEngine : BrowserEngine {
                         canGoBack = view.canGoBack(),
                         canGoForward = view.canGoForward(),
                     )
+                    val dt = if (pageStartMs > 0) (System.currentTimeMillis() - pageStartMs) else 0L
+                    _nativeEvents.tryEmit(
+                        NativeEvent.Console(
+                            NativeEvent.Console.Level.Info,
+                            "✓ Loaded: $url (${dt} ms)",
+                            url, null,
+                        )
+                    )
+                    // Self-test: confirm the JS bridge is actually exposed.
+                    view.evaluateJavascript(
+                        "(typeof window.__devbrowser_dbg !== 'undefined') ? 'true:' + window.__devbrowser_dbg.ping() : 'false'"
+                    ) { result ->
+                        val ok = result?.contains("true:pong") == true
+                        _nativeEvents.tryEmit(
+                            NativeEvent.Console(
+                                if (ok) NativeEvent.Console.Level.Debug else NativeEvent.Console.Level.Error,
+                                if (ok) "JS shim bridge online (window.__devbrowser_dbg.ping() → pong)"
+                                else "JS shim bridge NOT exposed (result=$result). Console capture limited.",
+                                null, null,
+                            )
+                        )
+                    }
                 }
 
                 override fun shouldOverrideUrlLoading(
@@ -253,28 +283,6 @@ class WebViewEngine : BrowserEngine {
         return wv
     }
 
-    private inner class DbgBridge {
-        @JavascriptInterface
-        fun post(level: String, text: String, source: String?, line: Int) {
-            val lvl = when (level) {
-                "error" -> NativeEvent.Console.Level.Error
-                "warn" -> NativeEvent.Console.Level.Warn
-                "info" -> NativeEvent.Console.Level.Info
-                "debug" -> NativeEvent.Console.Level.Debug
-                "verbose", "trace" -> NativeEvent.Console.Level.Verbose
-                else -> NativeEvent.Console.Level.Log
-            }
-            _nativeEvents.tryEmit(
-                NativeEvent.Console(
-                    level = lvl,
-                    text = text,
-                    sourceId = source,
-                    lineNumber = if (line >= 0) line else null,
-                )
-            )
-        }
-    }
-
     override fun loadUrl(url: String) { webView?.loadUrl(url) }
     override fun reload() { webView?.reload() }
     override fun goBack(): Boolean =
@@ -291,35 +299,41 @@ class WebViewEngine : BrowserEngine {
         webView = null
     }
 
+    val lastProbeReport = MutableStateFlow<List<Pair<String, String>>>(emptyList())
+
     override suspend fun cdpEndpoint(): CdpEndpoint? = withContext(Dispatchers.IO) {
         val pid = android.os.Process.myPid()
         val pkg = webView?.context?.packageName.orEmpty()
-        // Candidate socket names — modern WebView usually exposes
-        // webview_devtools_remote_<pid>, but historical and forked builds
-        // use other patterns. We probe each in priority order.
         val candidates = buildList {
             add("webview_devtools_remote_$pid")
             if (pkg.isNotEmpty()) {
                 add("webview_devtools_remote_$pkg")
                 add("${pkg}_devtools_remote")
-                add("${pkg}.debug_devtools_remote")
             }
             add("webview_devtools_remote")
             add("chrome_devtools_remote")
         }
-        val first = candidates.firstOrNull { probeDevToolsSocket(it) }
-        if (first != null) CdpEndpoint.UnixSocket(first) else null
+        val report = mutableListOf<Pair<String, String>>()
+        var hit: String? = null
+        for (name in candidates) {
+            val r = probeWithReason(name)
+            report += name to r
+            if (r == "ok") { hit = name; break }
+        }
+        lastProbeReport.value = report
+        if (hit != null) CdpEndpoint.UnixSocket(hit) else null
     }
 
-    /**
-     * Confirms a CDP server lives at the given abstract socket by asking for
-     * /json/version and checking for a 200 status line.
-     */
-    private fun probeDevToolsSocket(name: String): Boolean = runCatching {
+    /** Like [probeDevToolsSocket] but returns a human-readable reason. */
+    private fun probeWithReason(name: String): String = runCatching {
         val socket = LocalSocket()
         socket.use {
             it.soTimeout = 700
-            it.connect(LocalSocketAddress(name, LocalSocketAddress.Namespace.ABSTRACT))
+            try {
+                it.connect(LocalSocketAddress(name, LocalSocketAddress.Namespace.ABSTRACT))
+            } catch (e: Exception) {
+                return@use "no-listener (${e.javaClass.simpleName})"
+            }
             val out = it.outputStream
             out.write(
                 "GET /json/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -328,9 +342,10 @@ class WebViewEngine : BrowserEngine {
             out.flush()
             val reader = BufferedReader(InputStreamReader(it.inputStream))
             val statusLine = reader.readLine().orEmpty()
-            statusLine.contains("200")
+            if (statusLine.contains("200")) "ok" else "bad-status:$statusLine"
         }
-    }.getOrDefault(false)
+    }.getOrElse { "err:${it.javaClass.simpleName}" }
+
 
     override suspend fun evaluateJs(script: String): String? =
         suspendCancellableCoroutine { cont ->
