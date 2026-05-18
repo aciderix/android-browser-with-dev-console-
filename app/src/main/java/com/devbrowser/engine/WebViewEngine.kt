@@ -495,6 +495,7 @@ class WebViewEngine : BrowserEngine {
           }
 
           // ── DOM health checks ───────────────────────────────────────────
+          function clean(s){ return (s||'').replace(/\s+/g, ' ').trim(); }
           function snapshot(label){
             try {
               var roots = ['root','app','main','__next','__nuxt'];
@@ -510,12 +511,38 @@ class WebViewEngine : BrowserEngine {
               var info = label + ': readyState=' + document.readyState +
                 ', title="' + document.title + '"' +
                 ', bodyChildren=' + (body ? body.children.length : 0) +
-                ', bodyTextLen=' + (body ? (body.innerText||'').length : 0);
+                ', bodyTextLen=' + (body ? (body.innerText||'').length : 0) +
+                ', viewport=' + window.innerWidth + 'x' + window.innerHeight +
+                ', buttons=' + document.querySelectorAll('button,[role=button]').length +
+                ', inputs=' + document.querySelectorAll('input,select,textarea').length +
+                ', forms=' + document.querySelectorAll('form').length;
               if (found) {
-                info += ', mount[#' + found.id + ']={children:' + found.el.children.length +
-                  ', innerHTML.length:' + found.el.innerHTML.length + '}';
+                info += '\nmount[#' + found.id + ']{children=' + found.el.children.length +
+                  ', innerHTML.length=' + found.el.innerHTML.length + '}';
+                var bcr = found.el.getBoundingClientRect();
+                info += '\n  bbox=' + Math.round(bcr.width) + 'x' + Math.round(bcr.height) +
+                  ' at (' + Math.round(bcr.left) + ',' + Math.round(bcr.top) + ')';
+                var cs = window.getComputedStyle(found.el);
+                info += '\n  computed{display=' + cs.display + ', visibility=' + cs.visibility +
+                  ', opacity=' + cs.opacity + ', color=' + cs.color + ', bg=' + cs.backgroundColor + '}';
+                var txt = clean(found.el.innerText);
+                if (txt) info += '\n  innerText[0..400]="' + txt.substring(0, 400) + '"';
+                else info += '\n  innerText=(empty)';
+                var html = clean(found.el.innerHTML);
+                info += '\n  innerHTML[0..500]="' + html.substring(0, 500) + (html.length > 500 ? '…' : '') + '"';
+                // Walk first 5 visible children and report basics.
+                var kids = Array.prototype.slice.call(found.el.querySelectorAll('*')).slice(0, 8);
+                kids.forEach(function(k, idx){
+                  var r = k.getBoundingClientRect();
+                  var sc = window.getComputedStyle(k);
+                  info += '\n  [' + idx + '] <' + k.tagName.toLowerCase() +
+                    (k.id ? ' id=' + k.id : '') +
+                    (k.className && typeof k.className === 'string' ? ' class="' + k.className.substring(0,40) + '"' : '') +
+                    '> ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+                    ' d=' + sc.display + ' v=' + sc.visibility + ' op=' + sc.opacity;
+                });
               } else {
-                info += ', NO MOUNT POINT';
+                info += '\nNO MOUNT POINT FOUND';
               }
               emit('info', info);
             } catch(e){ emit('error', 'snapshot failed: ' + e); }
