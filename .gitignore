@@ -9,4 +9,5 @@ captures/
 local.properties
 *.apk
 *.aab
+!releases/*.apk
 .kotlin/

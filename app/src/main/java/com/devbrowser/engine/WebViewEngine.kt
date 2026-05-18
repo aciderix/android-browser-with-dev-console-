@@ -28,6 +28,10 @@ class WebViewEngine : BrowserEngine {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun createView(context: Context): View {
+        webView?.let { existing ->
+            (existing.parent as? android.view.ViewGroup)?.removeView(existing)
+            return existing
+        }
         val wv = WebView(context).apply {
             settings.apply {
                 javaScriptEnabled = true

@@ -2,98 +2,40 @@ package com.devbrowser.engine
 
 import android.content.Context
 import android.view.View
+import android.widget.TextView
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import org.mozilla.geckoview.GeckoRuntime
-import org.mozilla.geckoview.GeckoRuntimeSettings
-import org.mozilla.geckoview.GeckoSession
-import org.mozilla.geckoview.GeckoView
 
 /**
- * GeckoView-backed engine. Uses Firefox's Remote Debugging Protocol over a
- * TCP socket. The DevTools client adapts the protocol; for now we surface the
- * endpoint and basic navigation. Remote debugging server is enabled via
- * GeckoRuntimeSettings.aboutConfigEnabled + devtools.debugger.remote-enabled.
+ * Placeholder GeckoView engine. The full implementation lives at the
+ * commented-out import sites and uses org.mozilla.geckoview.* — the dependency
+ * has been removed from app/build.gradle.kts to keep the APK under GitHub's
+ * 100 MB file size limit. To re-enable Gecko:
+ *
+ *   1. Uncomment the geckoview implementation line in app/build.gradle.kts.
+ *   2. Replace this file with the version under git history that constructs
+ *      GeckoRuntime + GeckoSession + GeckoView.
+ *   3. Finish FirefoxRdpBridge so DevTools can attach.
  */
-class GeckoEngine(appContext: Context) : BrowserEngine {
+class GeckoEngine(@Suppress("UNUSED_PARAMETER") appContext: Context) : BrowserEngine {
 
-    private val runtime: GeckoRuntime by lazy {
-        val settings = GeckoRuntimeSettings.Builder()
-            .aboutConfigEnabled(true)
-            .remoteDebuggingEnabled(true)
-            .consoleOutput(true)
-            .build()
-        GeckoRuntime.create(appContext.applicationContext, settings)
-    }
-
-    private val session: GeckoSession = GeckoSession()
-    private var view: GeckoView? = null
-
-    private val _state = MutableStateFlow(EngineState())
+    private val _state = MutableStateFlow(EngineState(url = "gecko://disabled"))
     override val state = _state.asStateFlow()
 
-    init {
-        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
-            override fun onLocationChange(
-                session: GeckoSession,
-                url: String?,
-                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
-                hasUserGesture: Boolean,
-            ) {
-                _state.value = _state.value.copy(url = url.orEmpty())
-            }
-
-            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
-                _state.value = _state.value.copy(canGoBack = canGoBack)
-            }
-
-            override fun onCanGoForward(session: GeckoSession, canGoForward: Boolean) {
-                _state.value = _state.value.copy(canGoForward = canGoForward)
-            }
-        }
-        session.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStart(session: GeckoSession, url: String) {
-                _state.value = _state.value.copy(url = url, isLoading = true, progress = 0)
-            }
-
-            override fun onPageStop(session: GeckoSession, success: Boolean) {
-                _state.value = _state.value.copy(isLoading = false, progress = 100)
-            }
-
-            override fun onProgressChange(session: GeckoSession, progress: Int) {
-                _state.value = _state.value.copy(progress = progress)
-            }
-        }
-        session.contentDelegate = object : GeckoSession.ContentDelegate {
-            override fun onTitleChange(session: GeckoSession, title: String?) {
-                _state.value = _state.value.copy(title = title.orEmpty())
-            }
-        }
+    override fun createView(context: Context): View = TextView(context).apply {
+        text = "GeckoView engine is disabled in this build.\n\n" +
+            "Enable the geckoview dependency in app/build.gradle.kts to use it.\n" +
+            "The DevTools RDP→CDP bridge is also not yet implemented."
+        textSize = 14f
+        setPadding(48, 48, 48, 48)
     }
 
-    override fun createView(context: Context): View {
-        val v = GeckoView(context)
-        if (!session.isOpen) session.open(runtime)
-        v.setSession(session)
-        view = v
-        return v
-    }
-
-    override fun loadUrl(url: String) { session.loadUri(url) }
-    override fun reload() { session.reload() }
-    override fun goBack(): Boolean { session.goBack(); return true }
-    override fun goForward(): Boolean { session.goForward(); return true }
-    override fun stop() { session.stop() }
-    override fun destroy() {
-        if (session.isOpen) session.close()
-    }
-
-    override suspend fun cdpEndpoint(): CdpEndpoint? {
-        // Gecko's remote debugger listens on a TCP port (default 6000). We
-        // would translate Firefox RDP <-> CDP in a separate adapter layer.
-        // Returning null until that adapter is wired up.
-        return null
-    }
-
+    override fun loadUrl(url: String) = Unit
+    override fun reload() = Unit
+    override fun goBack(): Boolean = false
+    override fun goForward(): Boolean = false
+    override fun stop() = Unit
+    override fun destroy() = Unit
+    override suspend fun cdpEndpoint(): CdpEndpoint? = null
     override suspend fun evaluateJs(script: String): String? = null
 }

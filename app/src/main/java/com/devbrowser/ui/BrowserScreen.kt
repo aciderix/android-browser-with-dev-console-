@@ -1,22 +1,19 @@
 package com.devbrowser.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.HorizontalDivider
@@ -28,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -46,11 +44,11 @@ fun BrowserScreen(vm: BrowserViewModel) {
     val active = tabs.firstOrNull { it.id == activeId }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        TabBar(vm)
         if (active != null) {
             val state by active.engine.state.collectAsState()
             UrlBar(
                 url = state.url,
-                isLoading = state.isLoading,
                 canGoBack = state.canGoBack,
                 canGoForward = state.canGoForward,
                 onNavigate = vm::navigate,
@@ -71,10 +69,19 @@ fun BrowserScreen(vm: BrowserViewModel) {
 
         Box(modifier = Modifier.fillMaxSize()) {
             if (active != null) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx -> active.engine.createView(ctx).also { active.engine.loadUrl(active.initialUrl) } },
-                )
+                key(active.id) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx ->
+                            active.engine.createView(ctx).also {
+                                if (active.engine.state.value.url == "about:blank" &&
+                                    active.initialUrl != "about:blank") {
+                                    active.engine.loadUrl(active.initialUrl)
+                                }
+                            }
+                        },
+                    )
+                }
             }
             if (devOpen) {
                 DevToolsSheet(
@@ -90,7 +97,6 @@ fun BrowserScreen(vm: BrowserViewModel) {
 @Composable
 private fun UrlBar(
     url: String,
-    isLoading: Boolean,
     canGoBack: Boolean,
     canGoForward: Boolean,
     onNavigate: (String) -> Unit,
@@ -109,10 +115,10 @@ private fun UrlBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onBack, enabled = canGoBack) {
-            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
         }
         IconButton(onClick = onForward, enabled = canGoForward) {
-            Icon(Icons.Default.ArrowForward, contentDescription = "Forward")
+            Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Forward")
         }
         IconButton(onClick = onReload) {
             Icon(Icons.Default.Refresh, contentDescription = "Reload")
@@ -121,9 +127,7 @@ private fun UrlBar(
             value = text,
             onValueChange = { text = it },
             singleLine = true,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 4.dp),
+            modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
             keyboardActions = KeyboardActions(onGo = {
                 focus.clearFocus()

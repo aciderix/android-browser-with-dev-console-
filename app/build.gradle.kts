@@ -46,6 +46,15 @@ android {
         buildConfig = true
     }
 
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = false
+        }
+    }
+
     packaging {
         resources.excludes += setOf(
             "/META-INF/{AL2.0,LGPL2.1}",
@@ -72,8 +81,11 @@ dependencies {
     // WebView
     implementation("androidx.webkit:webkit:1.12.1")
 
-    // GeckoView (Firefox engine) — optional second engine
-    implementation("org.mozilla.geckoview:geckoview:133.0.20241209150345")
+    // GeckoView (Firefox engine) — disabled until the RDP→CDP bridge is finished.
+    // Enabling it adds ~140 MB of native libs to the APK. The GeckoEngine code
+    // path is preserved behind a feature flag; switch to true and uncomment the
+    // implementation line below to re-enable.
+    // implementation("org.mozilla.geckoview:geckoview:133.0.20241209150345")
 
     // Networking — OkHttp for WebSocket to local CDP socket
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
