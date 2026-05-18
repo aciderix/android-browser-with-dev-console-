@@ -11,6 +11,8 @@ import com.devbrowser.engine.WebViewEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -31,6 +33,19 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         newTab(EngineKind.WebView, "https://m.wikipedia.org/")
+        // Re-attach DevTools when the active tab changes (and DevTools is open).
+        viewModelScope.launch {
+            combine(_activeTabId, _devToolsOpen) { id, open -> id to open }
+                .distinctUntilChanged()
+                .collect { (id, open) ->
+                    val engine = _tabs.value.firstOrNull { it.id == id }?.engine
+                    if (open && engine != null) {
+                        devTools.attach(engine)
+                    } else if (!open) {
+                        devTools.detach()
+                    }
+                }
+        }
     }
 
     fun newTab(kind: EngineKind, initialUrl: String) {
@@ -75,12 +90,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleDevTools() {
-        val opening = !_devToolsOpen.value
-        _devToolsOpen.value = opening
-        val engine = activeTab()?.engine ?: return
-        viewModelScope.launch {
-            if (opening) devTools.attach(engine) else devTools.detach()
-        }
+        _devToolsOpen.value = !_devToolsOpen.value
     }
 
     fun onBackPressed(): Boolean {

@@ -4,10 +4,13 @@ import com.devbrowser.devtools.cdp.CdpClient
 import com.devbrowser.devtools.cdp.jsonParams
 import com.devbrowser.engine.BrowserEngine
 import com.devbrowser.engine.CdpEndpoint
+import com.devbrowser.engine.NativeEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -33,9 +36,13 @@ class DevToolsController(
 
     private var cdp: CdpClient? = null
     private var eventJob: Job? = null
+    private var nativeEventJob: Job? = null
 
     private val _status = MutableStateFlow(Status.Detached)
     val status: StateFlow<Status> = _status.asStateFlow()
+
+    private val _diagnostics = MutableStateFlow<String?>(null)
+    val diagnostics: StateFlow<String?> = _diagnostics.asStateFlow()
 
     val console = ConsoleState()
     val network = NetworkState()
@@ -49,20 +56,41 @@ class DevToolsController(
 
     suspend fun attach(engine: BrowserEngine) {
         detach()
-        val endpoint = engine.cdpEndpoint()
-        if (endpoint !is CdpEndpoint.UnixSocket) {
+        // Always wire the native console fallback first so messages flow even
+        // if CDP fails to connect.
+        nativeEventJob = scope.launch {
+            engine.nativeEvents.collect { onNativeEvent(it) }
+        }
+
+        // Discovery may race with WebView socket creation — retry a few times.
+        _status.value = Status.Connecting
+        _diagnostics.value = "Looking for WebView CDP socket…"
+        val endpoint = withTimeoutOrNull(4_000) {
+            var ep: CdpEndpoint?
+            while (true) {
+                ep = engine.cdpEndpoint()
+                if (ep is CdpEndpoint.UnixSocket) return@withTimeoutOrNull ep
+                delay(250)
+            }
+            @Suppress("UNREACHABLE_CODE") null
+        } as? CdpEndpoint.UnixSocket
+        if (endpoint == null) {
             _status.value = Status.Unsupported
+            _diagnostics.value = "No CDP socket found in /proc/net/unix. " +
+                "Native console fallback is active."
             return
         }
-        _status.value = Status.Connecting
+        _diagnostics.value = "Connecting to ${endpoint.name}…"
         val client = CdpClient(endpoint.name)
         cdp = client
         val ok = client.connectToFirstPage()
         if (!ok) {
             _status.value = Status.Failed
+            _diagnostics.value = "CDP handshake failed on ${endpoint.name}. Native console fallback is active."
             return
         }
         _status.value = Status.Connected
+        _diagnostics.value = "CDP connected via ${endpoint.name}"
 
         eventJob = scope.launch {
             client.events.collect { dispatch(it) }
@@ -81,6 +109,8 @@ class DevToolsController(
             client.fire("Overlay.enable")
             client.fire("DOMStorage.enable")
             client.fire("HeapProfiler.enable")
+            // Some WebView builds defer console events until this is called.
+            client.fire("Runtime.runIfWaitingForDebugger")
         }
         loadDom()
         refreshOriginAndStorage()
@@ -89,9 +119,52 @@ class DevToolsController(
     suspend fun detach() {
         eventJob?.cancel()
         eventJob = null
+        nativeEventJob?.cancel()
+        nativeEventJob = null
         cdp?.close()
         cdp = null
         _status.value = Status.Detached
+        _diagnostics.value = null
+    }
+
+    private fun onNativeEvent(event: NativeEvent) {
+        when (event) {
+            is NativeEvent.Console -> {
+                // Avoid duplicates: when CDP is delivering Runtime.consoleAPICalled
+                // already, skip the WebChromeClient mirror.
+                if (_status.value == Status.Connected) return
+                val level = when (event.level) {
+                    NativeEvent.Console.Level.Error -> ConsoleEntry.Level.Error
+                    NativeEvent.Console.Level.Warn -> ConsoleEntry.Level.Warn
+                    NativeEvent.Console.Level.Info -> ConsoleEntry.Level.Info
+                    NativeEvent.Console.Level.Debug -> ConsoleEntry.Level.Debug
+                    NativeEvent.Console.Level.Verbose -> ConsoleEntry.Level.Debug
+                    NativeEvent.Console.Level.Log -> ConsoleEntry.Level.Log
+                }
+                console.appendNative(level, event.text, event.sourceId, event.lineNumber)
+            }
+            is NativeEvent.NavigationError -> {
+                console.appendNative(
+                    ConsoleEntry.Level.Error,
+                    "navigation failed (${event.code}): ${event.description} — ${event.url}",
+                    null, null,
+                )
+            }
+            is NativeEvent.HttpError -> {
+                console.appendNative(
+                    ConsoleEntry.Level.Warn,
+                    "HTTP ${event.statusCode} ${event.description} — ${event.url}",
+                    event.url, null,
+                )
+            }
+            is NativeEvent.SslError -> {
+                console.appendNative(
+                    ConsoleEntry.Level.Error,
+                    "SSL error: ${event.description} — ${event.url}",
+                    event.url, null,
+                )
+            }
+        }
     }
 
     fun clearAll() {

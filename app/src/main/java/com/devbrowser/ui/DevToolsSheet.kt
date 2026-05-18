@@ -76,6 +76,7 @@ fun DevToolsSheet(
 
     var selected by remember { mutableStateOf(Panel.Console) }
     val status by controller.status.collectAsState()
+    val diagnostics by controller.diagnostics.collectAsState()
 
     Column(
         modifier = modifier
@@ -143,6 +144,15 @@ fun DevToolsSheet(
             IconButton(onClick = onClose) {
                 Icon(Icons.Default.Close, contentDescription = "Close")
             }
+        }
+
+        diagnostics?.let { msg ->
+            Text(
+                text = msg,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            )
         }
 
         ScrollableTabRow(

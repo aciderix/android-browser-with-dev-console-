@@ -3,7 +3,9 @@ package com.devbrowser.engine
 import android.content.Context
 import android.view.View
 import android.widget.TextView
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
@@ -21,6 +23,8 @@ class GeckoEngine(@Suppress("UNUSED_PARAMETER") appContext: Context) : BrowserEn
 
     private val _state = MutableStateFlow(EngineState(url = "gecko://disabled"))
     override val state = _state.asStateFlow()
+
+    override val nativeEvents = MutableSharedFlow<NativeEvent>().asSharedFlow()
 
     override fun createView(context: Context): View = TextView(context).apply {
         text = "GeckoView engine is disabled in this build.\n\n" +

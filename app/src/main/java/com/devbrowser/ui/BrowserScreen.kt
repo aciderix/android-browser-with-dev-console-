@@ -8,9 +8,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -20,9 +23,12 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -31,8 +37,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 
@@ -43,7 +52,12 @@ fun BrowserScreen(vm: BrowserViewModel) {
     val devOpen by vm.devToolsOpen.collectAsState()
     val active = tabs.firstOrNull { it.id == activeId }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+    ) {
         TabBar(vm)
         if (active != null) {
             val state by active.engine.state.collectAsState()
@@ -105,8 +119,15 @@ private fun UrlBar(
     onReload: () -> Unit,
     onToggleDevTools: () -> Unit,
 ) {
-    var text by remember(url) { mutableStateOf(url) }
+    var field by remember(url) { mutableStateOf(TextFieldValue(url, TextRange(url.length))) }
+    var hasFocus by remember { mutableStateOf(false) }
     val focus = LocalFocusManager.current
+
+    val selectionColors = TextSelectionColors(
+        handleColor = MaterialTheme.colorScheme.primary,
+        backgroundColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.4f),
+    )
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -123,20 +144,41 @@ private fun UrlBar(
         IconButton(onClick = onReload) {
             Icon(Icons.Default.Refresh, contentDescription = "Reload")
         }
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            singleLine = true,
-            modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = {
-                focus.clearFocus()
-                onNavigate(text)
-            }),
-        )
+        CompositionLocalProvider(LocalTextSelectionColors provides selectionColors) {
+            OutlinedTextField(
+                value = field,
+                onValueChange = { field = it },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 4.dp)
+                    .onFocusChanged { fs ->
+                        if (fs.isFocused && !hasFocus) {
+                            // First-time focus: select the whole URL so a single
+                            // tap-and-type replaces it. Subsequent focuses preserve
+                            // user's selection.
+                            field = field.copy(selection = TextRange(0, field.text.length))
+                        }
+                        hasFocus = fs.isFocused
+                    },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                keyboardActions = KeyboardActions(onGo = {
+                    focus.clearFocus()
+                    onNavigate(field.text)
+                }),
+            )
+        }
         IconButton(onClick = onToggleDevTools) {
             Icon(Icons.Default.Code, contentDescription = "DevTools")
         }
     }
     HorizontalDivider()
+
+    // Whenever the external URL changes (page navigation), refresh the field
+    // unless the user is currently editing.
+    LaunchedEffect(url) {
+        if (!hasFocus && field.text != url) {
+            field = TextFieldValue(url, TextRange(url.length))
+        }
+    }
 }

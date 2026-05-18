@@ -36,6 +36,10 @@ class ConsoleState {
     fun appendEvalResult(text: String) =
         add(ConsoleEntry(nextId(), ConsoleEntry.Level.EvalResult, text))
 
+    fun appendNative(level: ConsoleEntry.Level, text: String, source: String?, line: Int?) {
+        add(ConsoleEntry(nextId(), level, text, source = source, url = source, line = line))
+    }
+
     fun appendConsoleApi(params: JsonObject) {
         val type = params["type"]?.jsonPrimitive?.content ?: "log"
         val args = params["args"]?.jsonArray ?: JsonArray(emptyList())

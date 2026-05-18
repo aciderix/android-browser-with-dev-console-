@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -111,7 +112,7 @@ class CdpClient(private val socketName: String) {
         _state.value = ConnectionState.Disconnected
     }
 
-    /** Sends a CDP request and awaits the response. */
+    /** Sends a CDP request and awaits the response (5 s timeout). */
     suspend fun send(method: String, params: JsonObject? = null, sessionId: String? = null): CdpResponse {
         val socket = ws ?: error("CDP not connected")
         val id = nextId.getAndIncrement()
@@ -120,12 +121,14 @@ class CdpClient(private val socketName: String) {
         val req = CdpRequest(id = id, method = method, params = params, sessionId = sessionId)
         val text = json.encodeToString(req)
         withContext(Dispatchers.IO) { socket.sendText(text) }
-        return channel.receive()
+        return withTimeoutOrNull(5_000) { channel.receive() }
+            ?: CdpResponse(id = id, error = CdpError(-1, "timeout: $method"))
     }
 
     /** Convenience: send and ignore response. */
     suspend fun fire(method: String, params: JsonObject? = null) {
-        send(method, params)
+        // Use a shorter timeout so initial domain bring-up doesn't stall.
+        withTimeoutOrNull(2_000) { send(method, params) }
     }
 
     fun close() {

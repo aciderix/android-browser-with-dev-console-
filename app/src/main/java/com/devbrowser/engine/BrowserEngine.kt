@@ -2,6 +2,7 @@ package com.devbrowser.engine
 
 import android.content.Context
 import android.view.View
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -11,6 +12,13 @@ import kotlinx.coroutines.flow.StateFlow
  */
 interface BrowserEngine {
     val state: StateFlow<EngineState>
+
+    /**
+     * Native-side console/navigation events. Available regardless of whether
+     * the CDP bridge is connected — for WebView this is fed by
+     * WebChromeClient.onConsoleMessage and WebViewClient errors.
+     */
+    val nativeEvents: SharedFlow<NativeEvent>
 
     fun createView(context: Context): View
     fun loadUrl(url: String)
@@ -25,6 +33,35 @@ interface BrowserEngine {
 
     /** Executes JS in the page (best-effort, returns serialized result). */
     suspend fun evaluateJs(script: String): String?
+}
+
+sealed class NativeEvent {
+    data class Console(
+        val level: Level,
+        val text: String,
+        val sourceId: String?,
+        val lineNumber: Int?,
+    ) : NativeEvent() {
+        enum class Level { Verbose, Debug, Info, Log, Warn, Error }
+    }
+
+    data class NavigationError(
+        val url: String,
+        val code: Int,
+        val description: String,
+        val isMainFrame: Boolean,
+    ) : NativeEvent()
+
+    data class SslError(
+        val url: String,
+        val description: String,
+    ) : NativeEvent()
+
+    data class HttpError(
+        val url: String,
+        val statusCode: Int,
+        val description: String,
+    ) : NativeEvent()
 }
 
 data class EngineState(

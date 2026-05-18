@@ -9,6 +9,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.Modifier
+import androidx.core.view.WindowCompat
 import com.devbrowser.ui.BrowserScreen
 import com.devbrowser.ui.BrowserViewModel
 
@@ -18,6 +19,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -27,8 +29,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         if (!viewModel.onBackPressed()) {
+            @Suppress("DEPRECATION")
             super.onBackPressed()
         }
     }
