@@ -76,8 +76,15 @@ class DevToolsController(
         } as? CdpEndpoint.UnixSocket
         if (endpoint == null) {
             _status.value = Status.Unsupported
-            _diagnostics.value = "No CDP socket found in /proc/net/unix. " +
-                "Native console fallback is active."
+            _diagnostics.value = "No CDP socket reachable. " +
+                "Falling back to native + injected JS console capture."
+            console.appendNative(
+                ConsoleEntry.Level.Warn,
+                "CDP unavailable on this device. Console capture is using the " +
+                    "native + JS-shim fallback. All console.* calls and uncaught " +
+                    "errors will still appear here.",
+                null, null,
+            )
             return
         }
         _diagnostics.value = "Connecting to ${endpoint.name}…"
@@ -91,6 +98,11 @@ class DevToolsController(
         }
         _status.value = Status.Connected
         _diagnostics.value = "CDP connected via ${endpoint.name}"
+        console.appendNative(
+            ConsoleEntry.Level.Info,
+            "DevBrowser DevTools attached via CDP (${endpoint.name})",
+            null, null,
+        )
 
         eventJob = scope.launch {
             client.events.collect { dispatch(it) }

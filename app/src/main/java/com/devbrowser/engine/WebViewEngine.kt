@@ -3,6 +3,8 @@ package com.devbrowser.engine
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.net.http.SslError
 import android.os.Message
 import android.view.View
@@ -11,6 +13,7 @@ import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.JsResult
+import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
@@ -21,21 +24,39 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.File
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import org.json.JSONArray
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import kotlin.coroutines.resume
 
 /**
- * WebView-backed engine. Debugging is enabled application-wide via
- * WebView.setWebContentsDebuggingEnabled. The Chromium runtime exposes a CDP
- * endpoint over an abstract UNIX socket; we discover its real name by scanning
- * /proc/net/unix because the historical "webview_devtools_remote_<pid>" pattern
- * isn't guaranteed by modern WebView releases.
+ * WebView-backed engine.
+ *
+ * Console capture is layered three times so messages reach DevTools even on
+ * tightened Android builds:
+ *
+ *   1. CDP (Chrome DevTools Protocol) over the WebView's abstract UNIX
+ *      socket. Native to Chromium; richest signal (heap, network, debugger).
+ *   2. WebChromeClient.onConsoleMessage. Always-on Java callback that fires
+ *      for every console.* call. Works without CDP.
+ *   3. Pre-page JS shim (DBG_SHIM_JS) injected at navigation start via
+ *      WebViewCompat addDocumentStartJavaScript. Wraps console.* and global
+ *      error/unhandledrejection, posts strings back through a JS interface.
+ *      This catches messages that fire BEFORE either of the other layers
+ *      attaches, and serves as the final fallback if both fail.
+ *
+ * CDP socket discovery uses probe-based connection rather than scanning
+ * /proc/net/unix because Android 10+ SELinux policy filters that file for
+ * untrusted_app and returns no useful info.
  */
 class WebViewEngine : BrowserEngine {
 
@@ -44,12 +65,12 @@ class WebViewEngine : BrowserEngine {
     override val state = _state.asStateFlow()
 
     private val _nativeEvents = MutableSharedFlow<NativeEvent>(
-        replay = 32,
-        extraBufferCapacity = 256,
+        replay = 64,
+        extraBufferCapacity = 512,
     )
     override val nativeEvents = _nativeEvents.asSharedFlow()
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     override fun createView(context: Context): View {
         webView?.let { existing ->
             (existing.parent as? ViewGroup)?.removeView(existing)
@@ -71,7 +92,9 @@ class WebViewEngine : BrowserEngine {
                 allowFileAccess = false
                 allowContentAccess = true
                 cacheMode = WebSettings.LOAD_DEFAULT
-                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                // Echo-7 (and many self-hosted dev backends) load via HTTPS but talk
+                // to an HTTP backend — we always allow because this is a dev browser.
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 // Default UA contains "; wv" which some sites use to block WebView.
                 userAgentString = userAgentString.replace("; wv", "")
                 if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
@@ -80,6 +103,14 @@ class WebViewEngine : BrowserEngine {
             }
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+            // JS bridge for the pre-page shim. addJavascriptInterface is required
+            // for the shim to call back; the interface only accepts strings and
+            // never reflects them to the page.
+            addJavascriptInterface(DbgBridge(), "__devbrowser_dbg")
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(this, DBG_SHIM_JS, setOf("*"))
+            }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
@@ -90,6 +121,11 @@ class WebViewEngine : BrowserEngine {
                         canGoBack = view.canGoBack(),
                         canGoForward = view.canGoForward(),
                     )
+                    // On older webview builds without DOCUMENT_START_SCRIPT, inject
+                    // the shim manually as soon as the document begins parsing.
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                        view.evaluateJavascript(DBG_SHIM_JS, null)
+                    }
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
@@ -146,7 +182,6 @@ class WebViewEngine : BrowserEngine {
                             description = sslErrorMessage(error),
                         )
                     )
-                    // Block by default — same as Chrome's default behaviour.
                     handler.cancel()
                 }
             }
@@ -181,16 +216,13 @@ class WebViewEngine : BrowserEngine {
                 }
 
                 override fun onPermissionRequest(request: PermissionRequest) {
-                    // Auto-grant by default for DevTools usefulness on dev hosts.
                     request.grant(request.resources)
                 }
 
                 override fun onGeolocationPermissionsShowPrompt(
                     origin: String,
                     callback: GeolocationPermissions.Callback,
-                ) {
-                    callback.invoke(origin, true, false)
-                }
+                ) { callback.invoke(origin, true, false) }
 
                 override fun onJsAlert(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
                     _nativeEvents.tryEmit(
@@ -210,8 +242,6 @@ class WebViewEngine : BrowserEngine {
                     isUserGesture: Boolean,
                     resultMsg: Message,
                 ): Boolean {
-                    // Many sites trigger a popup that we redirect into the same WebView so
-                    // navigation isn't lost. Production code would open a new tab here.
                     val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
                     transport.webView = view
                     resultMsg.sendToTarget()
@@ -221,6 +251,28 @@ class WebViewEngine : BrowserEngine {
         }
         webView = wv
         return wv
+    }
+
+    private inner class DbgBridge {
+        @JavascriptInterface
+        fun post(level: String, text: String, source: String?, line: Int) {
+            val lvl = when (level) {
+                "error" -> NativeEvent.Console.Level.Error
+                "warn" -> NativeEvent.Console.Level.Warn
+                "info" -> NativeEvent.Console.Level.Info
+                "debug" -> NativeEvent.Console.Level.Debug
+                "verbose", "trace" -> NativeEvent.Console.Level.Verbose
+                else -> NativeEvent.Console.Level.Log
+            }
+            _nativeEvents.tryEmit(
+                NativeEvent.Console(
+                    level = lvl,
+                    text = text,
+                    sourceId = source,
+                    lineNumber = if (line >= 0) line else null,
+                )
+            )
+        }
     }
 
     override fun loadUrl(url: String) { webView?.loadUrl(url) }
@@ -239,27 +291,46 @@ class WebViewEngine : BrowserEngine {
         webView = null
     }
 
-    override suspend fun cdpEndpoint(): CdpEndpoint? {
-        // Scan the kernel's UNIX socket table for the WebView devtools socket.
-        // The historical naming pattern is webview_devtools_remote_<pid> but
-        // modern releases sometimes append the package name or a salt.
-        val candidates = findWebViewSocketNames()
-        val pidSuffix = "_${android.os.Process.myPid()}"
-        val preferred = candidates.firstOrNull { it.endsWith(pidSuffix) }
-            ?: candidates.firstOrNull()
-            ?: return null
-        return CdpEndpoint.UnixSocket(preferred)
+    override suspend fun cdpEndpoint(): CdpEndpoint? = withContext(Dispatchers.IO) {
+        val pid = android.os.Process.myPid()
+        val pkg = webView?.context?.packageName.orEmpty()
+        // Candidate socket names — modern WebView usually exposes
+        // webview_devtools_remote_<pid>, but historical and forked builds
+        // use other patterns. We probe each in priority order.
+        val candidates = buildList {
+            add("webview_devtools_remote_$pid")
+            if (pkg.isNotEmpty()) {
+                add("webview_devtools_remote_$pkg")
+                add("${pkg}_devtools_remote")
+                add("${pkg}.debug_devtools_remote")
+            }
+            add("webview_devtools_remote")
+            add("chrome_devtools_remote")
+        }
+        val first = candidates.firstOrNull { probeDevToolsSocket(it) }
+        if (first != null) CdpEndpoint.UnixSocket(first) else null
     }
 
-    private fun findWebViewSocketNames(): List<String> = runCatching {
-        File("/proc/net/unix").useLines { lines ->
-            lines.mapNotNull { line ->
-                val name = line.trim().split(Regex("\\s+")).lastOrNull() ?: return@mapNotNull null
-                // Abstract namespace sockets are prefixed with '@' in /proc/net/unix.
-                if (name.startsWith("@webview_devtools_remote")) name.substring(1) else null
-            }.toList().distinct()
+    /**
+     * Confirms a CDP server lives at the given abstract socket by asking for
+     * /json/version and checking for a 200 status line.
+     */
+    private fun probeDevToolsSocket(name: String): Boolean = runCatching {
+        val socket = LocalSocket()
+        socket.use {
+            it.soTimeout = 700
+            it.connect(LocalSocketAddress(name, LocalSocketAddress.Namespace.ABSTRACT))
+            val out = it.outputStream
+            out.write(
+                "GET /json/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    .toByteArray()
+            )
+            out.flush()
+            val reader = BufferedReader(InputStreamReader(it.inputStream))
+            val statusLine = reader.readLine().orEmpty()
+            statusLine.contains("200")
         }
-    }.getOrDefault(emptyList())
+    }.getOrDefault(false)
 
     override suspend fun evaluateJs(script: String): String? =
         suspendCancellableCoroutine { cont ->
@@ -279,4 +350,55 @@ class WebViewEngine : BrowserEngine {
         if (error.hasError(SslError.SSL_UNTRUSTED)) append("untrusted issuer; ")
         if (error.hasError(SslError.SSL_INVALID)) append("invalid; ")
     }.ifEmpty { "ssl error" }
+
+    companion object {
+        // Pre-page JS shim that wraps console.* and global error/unhandledrejection,
+        // forwarding everything to native via __devbrowser_dbg.post(level,text,src,line).
+        // Stays passive if the bridge is missing (e.g. before injection).
+        private val DBG_SHIM_JS = """
+        (function(){
+          if (window.__devbrowser_shim_installed) return;
+          window.__devbrowser_shim_installed = true;
+          function bridge(){ return window.__devbrowser_dbg; }
+          function stringify(arg){
+            try {
+              if (arg === null) return 'null';
+              if (arg === undefined) return 'undefined';
+              if (arg instanceof Error) return (arg.stack || (arg.name + ': ' + arg.message));
+              if (typeof arg === 'object') {
+                try { return JSON.stringify(arg); }
+                catch(e){ return Object.prototype.toString.call(arg); }
+              }
+              return String(arg);
+            } catch(e){ return '[unserialisable]'; }
+          }
+          ['log','info','warn','error','debug','trace'].forEach(function(name){
+            var orig = console[name] ? console[name].bind(console) : function(){};
+            console[name] = function(){
+              var args = Array.prototype.slice.call(arguments);
+              var text = args.map(stringify).join(' ');
+              try { var b = bridge(); if (b) b.post(name, text, location.href, -1); } catch(e){}
+              return orig.apply(console, args);
+            };
+          });
+          window.addEventListener('error', function(ev){
+            try {
+              var b = bridge();
+              if (b) {
+                var msg = (ev.error && ev.error.stack) ? ev.error.stack
+                    : (ev.message + ' at ' + (ev.filename||'?') + ':' + (ev.lineno||0));
+                b.post('error', msg, ev.filename || location.href, ev.lineno|0);
+              }
+            } catch(e){}
+          }, true);
+          window.addEventListener('unhandledrejection', function(ev){
+            try {
+              var b = bridge();
+              if (b) b.post('error', 'Unhandled rejection: ' + stringify(ev.reason),
+                            location.href, -1);
+            } catch(e){}
+          }, true);
+        })();
+        """.trimIndent()
+    }
 }
