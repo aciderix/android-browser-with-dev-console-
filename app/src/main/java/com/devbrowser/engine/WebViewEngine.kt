@@ -494,6 +494,31 @@ class WebViewEngine : BrowserEngine {
             window.WebSocket.CLOSED = 3;
           }
 
+          // ── Viewport / layout compat patch ──────────────────────────────
+          // Tailwind h-screen (100vh) sometimes evaluates to 0 in Android
+          // WebView inside a Compose AndroidView, causing SPAs to render in a
+          // zero-height container that hides everything via overflow:hidden.
+          // The fix is universal: force html/body to fill the viewport and
+          // give common SPA mount points a sensible min-height.
+          try {
+            var style = document.createElement('style');
+            style.setAttribute('data-devbrowser','viewport-fix');
+            style.textContent =
+              'html,body{min-height:100%;height:100%;}' +
+              '#root,#app,#main,#__next,#__nuxt{min-height:100vh;min-height:100dvh;}';
+            if (document.head) document.head.appendChild(style);
+            else {
+              // head not built yet, wait for it
+              var obs = new MutationObserver(function(){
+                if (document.head) {
+                  document.head.appendChild(style);
+                  obs.disconnect();
+                }
+              });
+              obs.observe(document.documentElement, {childList: true, subtree: true});
+            }
+          } catch(e){ emit('warn', 'viewport-fix injection failed: ' + e); }
+
           // ── DOM health checks ───────────────────────────────────────────
           function clean(s){ return (s||'').replace(/\s+/g, ' ').trim(); }
           function snapshot(label){

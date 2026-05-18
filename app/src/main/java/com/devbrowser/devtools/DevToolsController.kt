@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -36,6 +37,7 @@ class DevToolsController(
 ) {
 
     private var cdp: CdpClient? = null
+    private var attachedEngine: BrowserEngine? = null
     private var eventJob: Job? = null
     private var nativeEventJob: Job? = null
 
@@ -57,6 +59,7 @@ class DevToolsController(
 
     suspend fun attach(engine: BrowserEngine) {
         detach()
+        attachedEngine = engine
         // Always wire the native console fallback first so messages flow even
         // if CDP fails to connect.
         nativeEventJob = scope.launch {
@@ -136,6 +139,7 @@ class DevToolsController(
         nativeEventJob = null
         cdp?.close()
         cdp = null
+        attachedEngine = null
         _status.value = Status.Detached
         _diagnostics.value = null
     }
@@ -188,24 +192,60 @@ class DevToolsController(
     // ─── Console / Eval ───
 
     suspend fun evaluate(expression: String): String? {
-        val client = cdp ?: return null
-        val resp = client.send(
-            "Runtime.evaluate",
-            jsonParams {
-                put("expression", expression)
-                put("includeCommandLineAPI", true)
-                put("returnByValue", false)
-                put("generatePreview", true)
-                put("userGesture", true)
-                put("awaitPromise", true)
-                put("replMode", true)
+        // CDP path: rich result (preview, exception details). Preferred when available.
+        val client = cdp
+        if (client != null) {
+            val resp = client.send(
+                "Runtime.evaluate",
+                jsonParams {
+                    put("expression", expression)
+                    put("includeCommandLineAPI", true)
+                    put("returnByValue", false)
+                    put("generatePreview", true)
+                    put("userGesture", true)
+                    put("awaitPromise", true)
+                    put("replMode", true)
+                }
+            )
+            val result = resp.result ?: return resp.error?.message
+            result["exceptionDetails"]?.let { console.appendException(it.jsonObject) }
+            return result["result"]?.let { remoteObjectToText(it) }
+                ?.also { console.appendEvalResult(it) }
+        }
+        // Native fallback: wrap the expression so we capture both value and errors.
+        // The wrap: try { JSON.stringify(<expr>) } catch(e) { '__err__:' + e.toString() }
+        val engine = attachedEngine ?: return "(no engine attached)".also { console.appendEvalResult(it) }
+        val wrapped = "(function(){try{var v=eval(${jsStringLiteral(expression)});" +
+            "if (v===undefined) return 'undefined';" +
+            "if (v===null) return 'null';" +
+            "if (typeof v==='function') return v.toString();" +
+            "try { return JSON.stringify(v); } catch(e) { return String(v); }" +
+            "}catch(e){return '__err__:'+(e.stack||e.toString());}})()"
+        val raw = engine.evaluateJs(wrapped) ?: "(no result)"
+        val text = try {
+            // evaluateJavascript returns the result JSON-encoded. Strip outer quotes if string.
+            val s = raw
+            if (s.startsWith("\"__err__:")) {
+                val err = jsonCodec.decodeFromString<String>(s).removePrefix("__err__:")
+                console.appendNative(ConsoleEntry.Level.Error, err, null, null)
+                err
+            } else {
+                // evaluateJavascript wraps strings in quotes; un-quote for nicer display
+                if (s.length >= 2 && s.first() == '"' && s.last() == '"') {
+                    jsonCodec.decodeFromString<String>(s)
+                } else s
             }
-        )
-        val result = resp.result ?: return resp.error?.message
-        result["exceptionDetails"]?.let { console.appendException(it.jsonObject) }
-        return result["result"]?.let { remoteObjectToText(it) }
-            ?.also { console.appendEvalResult(it) }
+        } catch (e: Exception) { raw }
+        console.appendEvalResult(text)
+        return text
     }
+
+    private fun jsStringLiteral(s: String): String {
+        val escaped = s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r")
+        return "'$escaped'"
+    }
+
+    private val jsonCodec = Json { ignoreUnknownKeys = true; isLenient = true }
 
     // ─── Elements ───
 
