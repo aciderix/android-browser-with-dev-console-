@@ -350,6 +350,11 @@ class SourcesState {
         _selectedScriptId.value = null
         _selectedSource.value = null
     }
+
+    /** Replace the script list wholesale (shim path; CDP path uses onScriptParsed). */
+    fun replaceScripts(list: List<ParsedScript>) {
+        _scripts.value = list
+    }
 }
 
 // ─────────── Performance ───────────

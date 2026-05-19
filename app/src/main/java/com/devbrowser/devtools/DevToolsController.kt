@@ -40,6 +40,7 @@ class DevToolsController(
     private var attachedEngine: BrowserEngine? = null
     private var eventJob: Job? = null
     private var nativeEventJob: Job? = null
+    private var stateJob: Job? = null
 
     private val _status = MutableStateFlow(Status.Detached)
     val status: StateFlow<Status> = _status.asStateFlow()
@@ -82,6 +83,21 @@ class DevToolsController(
             _status.value = Status.Unsupported
             val report = (engine as? WebViewEngine)?.lastProbeReport?.value.orEmpty()
             _diagnostics.value = "CDP unreachable (${report.size} probes). Shim active."
+            // Re-populate panels every time the page finishes loading a new URL.
+            stateJob = scope.launch {
+                var lastUrl = ""
+                var lastLoading = true
+                engine.state.collect { s ->
+                    val justFinished = lastLoading && !s.isLoading
+                    val urlChanged = s.url != lastUrl
+                    if (justFinished || (urlChanged && !s.isLoading)) {
+                        shimInitialRefresh()
+                    }
+                    lastUrl = s.url
+                    lastLoading = s.isLoading
+                }
+            }
+            shimInitialRefresh()
             return
         }
         _diagnostics.value = "Connecting to ${endpoint.name}…"
@@ -125,6 +141,8 @@ class DevToolsController(
         eventJob = null
         nativeEventJob?.cancel()
         nativeEventJob = null
+        stateJob?.cancel()
+        stateJob = null
         cdp?.close()
         cdp = null
         attachedEngine = null
@@ -149,6 +167,20 @@ class DevToolsController(
                 }
             }
             is NativeEvent.Console -> {
+                // Picker callback message — handle then suppress from console.
+                if (event.text.startsWith("__pick__:")) {
+                    val parts = event.text.removePrefix("__pick__:").split(":", limit = 2)
+                    val nodeId = parts.getOrNull(0)?.toLongOrNull()
+                    if (nodeId != null && nodeId > 0) {
+                        scope.launch {
+                            selectNode(nodeId)
+                            elements.setPicking(false)
+                        }
+                    } else {
+                        scope.launch { elements.setPicking(false) }
+                    }
+                    return
+                }
                 // Avoid duplicates: when CDP is delivering Runtime.consoleAPICalled
                 // already, skip the WebChromeClient mirror.
                 if (_status.value == Status.Connected) return
@@ -242,6 +274,14 @@ class DevToolsController(
         return text
     }
 
+    /** Run all shim-side panel population in parallel. */
+    private suspend fun shimInitialRefresh() {
+        runCatching { loadDom() }
+        runCatching { refreshScripts() }
+        runCatching { refreshOriginAndStorage() }
+        runCatching { refreshPerformanceMetrics() }
+    }
+
     /** Trigger an on-demand DOM health snapshot via the JS shim. */
     suspend fun snapshotPage() {
         val engine = attachedEngine ?: return
@@ -260,15 +300,26 @@ class DevToolsController(
     // ─── Elements ───
 
     suspend fun loadDom() {
-        val client = cdp ?: return
-        val resp = runCatching {
-            client.send("DOM.getDocument", jsonParams {
-                put("depth", 2)
-                put("pierce", true)
-            })
-        }.getOrNull() ?: return
-        val rootObj = resp.result?.get("root")?.jsonObject ?: return
-        elements.setRoot(parseDomNode(rootObj))
+        val client = cdp
+        if (client != null) {
+            val resp = runCatching {
+                client.send("DOM.getDocument", jsonParams {
+                    put("depth", 2)
+                    put("pierce", true)
+                })
+            }.getOrNull() ?: return
+            val rootObj = resp.result?.get("root")?.jsonObject ?: return
+            elements.setRoot(parseDomNode(rootObj))
+            return
+        }
+        // Shim fallback
+        val engine = attachedEngine ?: return
+        val raw = engine.evaluateJs("JSON.stringify(__devbrowser_dom_get(8))") ?: return
+        val unquoted = if (raw.startsWith("\"")) {
+            runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+        } else raw
+        val obj = runCatching { jsonCodec.parseToJsonElement(unquoted).jsonObject }.getOrNull() ?: return
+        elements.setRoot(parseDomNode(obj))
     }
 
     suspend fun expandNode(node: DomNode) {
@@ -294,56 +345,84 @@ class DevToolsController(
 
     suspend fun selectNode(nodeId: Long) {
         elements.select(nodeId)
-        val client = cdp ?: return
-        runCatching {
-            val resp = client.send("CSS.getComputedStyleForNode", jsonParams {
-                put("nodeId", nodeId)
-            })
-            val arr = resp.result?.get("computedStyle")?.jsonArray ?: return@runCatching
-            val styles = arr.map { e ->
-                val o = e.jsonObject
-                (o["name"]?.jsonPrimitive?.content.orEmpty()) to
-                    (o["value"]?.jsonPrimitive?.content.orEmpty())
+        val client = cdp
+        if (client != null) {
+            runCatching {
+                val resp = client.send("CSS.getComputedStyleForNode", jsonParams { put("nodeId", nodeId) })
+                val arr = resp.result?.get("computedStyle")?.jsonArray ?: return@runCatching
+                val styles = arr.map { e ->
+                    val o = e.jsonObject
+                    (o["name"]?.jsonPrimitive?.content.orEmpty()) to
+                        (o["value"]?.jsonPrimitive?.content.orEmpty())
+                }
+                elements.setComputedStyle(styles)
             }
-            elements.setComputedStyle(styles)
-        }
-        runCatching {
-            client.send("Overlay.highlightNode", jsonParams {
-                put("nodeId", nodeId)
-                put("highlightConfig", buildJsonObject {
-                    put("showInfo", true)
-                    put("contentColor", colorOf(0x90, 0xCD, 0xF4, 0.6f))
-                    put("paddingColor", colorOf(0xB6, 0xFC, 0xCD, 0.6f))
-                    put("borderColor", colorOf(0xFC, 0xDD, 0x8E, 0.6f))
-                    put("marginColor", colorOf(0xFE, 0xD7, 0xD7, 0.6f))
+            runCatching {
+                client.send("Overlay.highlightNode", jsonParams {
+                    put("nodeId", nodeId)
+                    put("highlightConfig", buildJsonObject {
+                        put("showInfo", true)
+                        put("contentColor", colorOf(0x90, 0xCD, 0xF4, 0.6f))
+                        put("paddingColor", colorOf(0xB6, 0xFC, 0xCD, 0.6f))
+                        put("borderColor", colorOf(0xFC, 0xDD, 0x8E, 0.6f))
+                        put("marginColor", colorOf(0xFE, 0xD7, 0xD7, 0.6f))
+                    })
                 })
-            })
+            }
+            return
         }
+        // Shim fallback
+        val engine = attachedEngine ?: return
+        engine.evaluateJs("__devbrowser_highlight($nodeId)")
+        val raw = engine.evaluateJs("JSON.stringify(__devbrowser_computed_style($nodeId))") ?: return
+        val unquoted = if (raw.startsWith("\"")) {
+            runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+        } else raw
+        val arr = runCatching { jsonCodec.parseToJsonElement(unquoted).jsonArray }.getOrNull() ?: return
+        val styles = arr.map { e ->
+            val o = e.jsonObject
+            (o["name"]?.jsonPrimitive?.content.orEmpty()) to
+                (o["value"]?.jsonPrimitive?.content.orEmpty())
+        }
+        elements.setComputedStyle(styles)
     }
 
     suspend fun setAttribute(nodeId: Long, name: String, value: String) {
-        val client = cdp ?: return
-        runCatching {
-            client.send("DOM.setAttributeValue", jsonParams {
-                put("nodeId", nodeId)
-                put("name", name)
-                put("value", value)
-            })
+        val client = cdp
+        if (client != null) {
+            runCatching {
+                client.send("DOM.setAttributeValue", jsonParams {
+                    put("nodeId", nodeId)
+                    put("name", name)
+                    put("value", value)
+                })
+            }
+            return
         }
+        attachedEngine?.evaluateJs(
+            "__devbrowser_set_attr($nodeId, ${jsStringLiteral(name)}, ${jsStringLiteral(value)})"
+        )
+        loadDom()
     }
 
     suspend fun setPickMode(enabled: Boolean) {
-        val client = cdp ?: return
+        val client = cdp
         elements.setPicking(enabled)
-        runCatching {
-            client.send("Overlay.setInspectMode", jsonParams {
-                put("mode", if (enabled) "searchForNode" else "none")
-                put("highlightConfig", buildJsonObject {
-                    put("showInfo", true)
-                    put("contentColor", colorOf(0x90, 0xCD, 0xF4, 0.6f))
+        if (client != null) {
+            runCatching {
+                client.send("Overlay.setInspectMode", jsonParams {
+                    put("mode", if (enabled) "searchForNode" else "none")
+                    put("highlightConfig", buildJsonObject {
+                        put("showInfo", true)
+                        put("contentColor", colorOf(0x90, 0xCD, 0xF4, 0.6f))
+                    })
                 })
-            })
+            }
+            return
         }
+        // Shim fallback — install an in-page touch picker.
+        val engine = attachedEngine ?: return
+        engine.evaluateJs(if (enabled) "__devbrowser_pick_start()" else "__devbrowser_pick_stop()")
     }
 
     private fun colorOf(r: Int, g: Int, b: Int, a: Float): JsonObject = buildJsonObject {
@@ -353,14 +432,42 @@ class DevToolsController(
     // ─── Sources ───
 
     suspend fun loadScriptSource(scriptId: String) {
-        val client = cdp ?: return
-        val resp = runCatching {
-            client.send("Debugger.getScriptSource", jsonParams {
-                put("scriptId", scriptId)
-            })
-        }.getOrNull() ?: return
-        val src = resp.result?.get("scriptSource")?.jsonPrimitive?.content
-        sources.selectScript(scriptId, src)
+        val client = cdp
+        if (client != null) {
+            val resp = runCatching {
+                client.send("Debugger.getScriptSource", jsonParams { put("scriptId", scriptId) })
+            }.getOrNull() ?: return
+            val src = resp.result?.get("scriptSource")?.jsonPrimitive?.content
+            sources.selectScript(scriptId, src)
+            return
+        }
+        // Shim fallback: inline script content via the bridge, external via sync XHR.
+        val engine = attachedEngine ?: return
+        val inlineRaw = engine.evaluateJs(
+            "__devbrowser_get_script_source(${jsStringLiteral(scriptId)})"
+        )
+        if (inlineRaw != null && inlineRaw != "null") {
+            val unquoted = if (inlineRaw.startsWith("\"")) {
+                runCatching { jsonCodec.decodeFromString<String>(inlineRaw) }.getOrDefault(inlineRaw)
+            } else inlineRaw
+            sources.selectScript(scriptId, unquoted)
+            return
+        }
+        val script = sources.scripts.value.firstOrNull { it.scriptId == scriptId }
+        val url = script?.url
+        if (url == null || url.startsWith("inline-")) {
+            sources.selectScript(scriptId, "(no source available)")
+            return
+        }
+        // Sync XHR. Deprecated for production but fine for a debug capture.
+        val js = "(function(){try{var x=new XMLHttpRequest();" +
+            "x.open('GET',${jsStringLiteral(url)},false);x.send();return x.responseText;" +
+            "}catch(e){return '__err__:'+e;}})()"
+        val raw = engine.evaluateJs(js) ?: "(fetch failed)"
+        val text = if (raw.startsWith("\"")) {
+            runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+        } else raw
+        sources.selectScript(scriptId, text)
     }
 
     suspend fun pause() { runCatching { cdp?.fire("Debugger.pause") } }
@@ -372,17 +479,32 @@ class DevToolsController(
     // ─── Performance ───
 
     suspend fun refreshPerformanceMetrics() {
-        val client = cdp ?: return
-        val resp = runCatching {
-            client.send("Performance.getMetrics")
-        }.getOrNull() ?: return
-        val arr = resp.result?.get("metrics")?.jsonArray ?: return
-        val list = arr.map {
-            val o = it.jsonObject
-            PerformanceMetric(
-                name = o["name"]?.jsonPrimitive?.content.orEmpty(),
-                value = o["value"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
-            )
+        val client = cdp
+        val list: List<PerformanceMetric>
+        if (client != null) {
+            val resp = runCatching { client.send("Performance.getMetrics") }.getOrNull() ?: return
+            val arr = resp.result?.get("metrics")?.jsonArray ?: return
+            list = arr.map {
+                val o = it.jsonObject
+                PerformanceMetric(
+                    name = o["name"]?.jsonPrimitive?.content.orEmpty(),
+                    value = o["value"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                )
+            }
+        } else {
+            val engine = attachedEngine ?: return
+            val raw = engine.evaluateJs("JSON.stringify(__devbrowser_get_perf())") ?: return
+            val unquoted = if (raw.startsWith("\"")) {
+                runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+            } else raw
+            val arr = runCatching { jsonCodec.parseToJsonElement(unquoted).jsonArray }.getOrNull() ?: return
+            list = arr.map {
+                val o = it.jsonObject
+                PerformanceMetric(
+                    name = o["name"]?.jsonPrimitive?.content.orEmpty(),
+                    value = o["value"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                )
+            }
         }
         performance.setMetrics(list)
         val used = list.firstOrNull { it.name == "JSHeapUsedSize" }?.value?.toLong()
@@ -420,23 +542,33 @@ class DevToolsController(
     // ─── Memory ───
 
     suspend fun collectGarbage() {
-        runCatching { cdp?.fire("HeapProfiler.collectGarbage") }
+        val client = cdp
+        if (client != null) {
+            runCatching { client.fire("HeapProfiler.collectGarbage") }
+        } else {
+            // Best-effort: window.gc is exposed if Chromium is started with
+            // --js-flags="--expose-gc". Usually not the case in WebView, but
+            // we can at least try to drop references.
+            attachedEngine?.evaluateJs("(typeof gc === 'function') ? (gc(), 'ok') : 'unavailable'")
+        }
         refreshPerformanceMetrics()
     }
 
     suspend fun takeHeapSnapshot() {
-        val client = cdp ?: return
         memory.setSampling(true)
-        runCatching {
-            client.send("HeapProfiler.takeHeapSnapshot", jsonParams {
-                put("reportProgress", false)
-                put("captureNumericValue", false)
-            })
+        val client = cdp
+        if (client != null) {
+            runCatching {
+                client.send("HeapProfiler.takeHeapSnapshot", jsonParams {
+                    put("reportProgress", false)
+                    put("captureNumericValue", false)
+                })
+            }
         }
         memory.setSampling(false)
-        // The actual snapshot is streamed via HeapProfiler.addHeapSnapshotChunk events;
-        // for now we just record the operation and refresh metrics.
         refreshPerformanceMetrics()
+        // Without CDP we can't get a true heap snapshot — record the
+        // current heap-used value as a sampled checkpoint instead.
         val used = memory.jsHeapUsedBytes.value ?: 0
         memory.appendSnapshot(used)
     }
@@ -444,70 +576,96 @@ class DevToolsController(
     // ─── Application / Storage ───
 
     suspend fun refreshOriginAndStorage() {
-        val client = cdp ?: return
-        val origin = runCatching {
-            client.send("Runtime.evaluate", jsonParams {
-                put("expression", "location.origin")
-                put("returnByValue", true)
-            }).result?.get("result")?.jsonObject?.get("value")?.jsonPrimitive?.content
-        }.getOrNull()
-        application.setOrigin(origin)
-        if (origin != null) {
-            loadCookies()
-            loadDomStorage(origin)
-        }
-    }
-
-    suspend fun loadCookies() {
-        val client = cdp ?: return
-        val resp = runCatching { client.send("Network.getCookies") }.getOrNull() ?: return
-        val arr = resp.result?.get("cookies")?.jsonArray ?: return
-        application.setCookies(arr.map { ce ->
-            val o = ce.jsonObject
-            Cookie(
-                name = o["name"]?.jsonPrimitive?.content.orEmpty(),
-                value = o["value"]?.jsonPrimitive?.content.orEmpty(),
-                domain = o["domain"]?.jsonPrimitive?.content.orEmpty(),
-                path = o["path"]?.jsonPrimitive?.content.orEmpty(),
-                expires = o["expires"]?.jsonPrimitive?.content?.toDoubleOrNull(),
-                secure = o["secure"]?.jsonPrimitive?.content == "true",
-                httpOnly = o["httpOnly"]?.jsonPrimitive?.content == "true",
-                sameSite = o["sameSite"]?.jsonPrimitive?.content,
-            )
-        })
-    }
-
-    suspend fun loadDomStorage(origin: String) {
-        val client = cdp ?: return
-        suspend fun fetch(isLocal: Boolean): List<StorageItem> {
-            val resp = runCatching {
-                client.send("DOMStorage.getDOMStorageItems", jsonParams {
-                    put("storageId", buildJsonObject {
-                        put("securityOrigin", origin)
-                        put("isLocalStorage", isLocal)
-                    })
-                })
-            }.getOrNull() ?: return emptyList()
-            val entries = resp.result?.get("entries")?.jsonArray ?: return emptyList()
-            return entries.mapNotNull { kv ->
-                val a = kv.jsonArray
-                if (a.size < 2) null
-                else StorageItem(a[0].jsonPrimitive.content, a[1].jsonPrimitive.content)
+        val client = cdp
+        if (client != null) {
+            val origin = runCatching {
+                client.send("Runtime.evaluate", jsonParams {
+                    put("expression", "location.origin")
+                    put("returnByValue", true)
+                }).result?.get("result")?.jsonObject?.get("value")?.jsonPrimitive?.content
+            }.getOrNull()
+            application.setOrigin(origin)
+            if (origin != null) {
+                loadCookies()
+                loadDomStorage(origin)
             }
+            return
         }
-        application.setLocalStorage(fetch(true))
-        application.setSessionStorage(fetch(false))
+        // Shim fallback — one call returns origin + cookies + both storages.
+        val engine = attachedEngine ?: return
+        val raw = engine.evaluateJs("JSON.stringify(__devbrowser_get_storage())") ?: return
+        val unquoted = if (raw.startsWith("\"")) {
+            runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+        } else raw
+        val obj = runCatching { jsonCodec.parseToJsonElement(unquoted).jsonObject }.getOrNull() ?: return
+        application.setOrigin(obj["origin"]?.jsonPrimitive?.content)
+        application.setCookies(
+            (obj["cookies"]?.jsonArray ?: kotlinx.serialization.json.JsonArray(emptyList())).map { c ->
+                val o = c.jsonObject
+                Cookie(
+                    name = o["name"]?.jsonPrimitive?.content.orEmpty(),
+                    value = o["value"]?.jsonPrimitive?.content.orEmpty(),
+                    domain = o["domain"]?.jsonPrimitive?.content.orEmpty(),
+                    path = o["path"]?.jsonPrimitive?.content.orEmpty(),
+                    expires = null,
+                    secure = o["secure"]?.jsonPrimitive?.content == "true",
+                    httpOnly = false,
+                    sameSite = o["sameSite"]?.jsonPrimitive?.content,
+                )
+            }
+        )
+        fun parseItems(arr: kotlinx.serialization.json.JsonArray?): List<StorageItem> =
+            arr.orEmpty().map { i ->
+                val o = i.jsonObject
+                StorageItem(
+                    key = o["key"]?.jsonPrimitive?.content.orEmpty(),
+                    value = o["value"]?.jsonPrimitive?.content.orEmpty(),
+                )
+            }
+        application.setLocalStorage(parseItems(obj["localStorage"]?.jsonArray))
+        application.setSessionStorage(parseItems(obj["sessionStorage"]?.jsonArray))
     }
+
+    suspend fun loadCookies() = refreshOriginAndStorage()
+
+    suspend fun loadDomStorage(origin: String) = refreshOriginAndStorage()
 
     suspend fun deleteCookie(name: String, domain: String) {
-        val client = cdp ?: return
-        runCatching {
-            client.send("Network.deleteCookies", jsonParams {
-                put("name", name)
-                put("domain", domain)
-            })
+        val client = cdp
+        if (client != null) {
+            runCatching {
+                client.send("Network.deleteCookies", jsonParams {
+                    put("name", name)
+                    put("domain", domain)
+                })
+            }
+        } else {
+            attachedEngine?.evaluateJs("__devbrowser_delete_cookie(${jsStringLiteral(name)})")
         }
-        loadCookies()
+        refreshOriginAndStorage()
+    }
+
+    // ─── Sources ───
+
+    /** Populate the script list from the page via the shim when CDP is off. */
+    suspend fun refreshScripts() {
+        if (cdp != null) return // CDP fires Debugger.scriptParsed events
+        val engine = attachedEngine ?: return
+        val raw = engine.evaluateJs("JSON.stringify(__devbrowser_get_scripts())") ?: return
+        val unquoted = if (raw.startsWith("\"")) {
+            runCatching { jsonCodec.decodeFromString<String>(raw) }.getOrDefault(raw)
+        } else raw
+        val arr = runCatching { jsonCodec.parseToJsonElement(unquoted).jsonArray }.getOrNull() ?: return
+        val list = arr.map {
+            val o = it.jsonObject
+            ParsedScript(
+                scriptId = o["scriptId"]?.jsonPrimitive?.content.orEmpty(),
+                url = o["url"]?.jsonPrimitive?.content.orEmpty(),
+                isModule = o["isModule"]?.jsonPrimitive?.content == "true",
+                length = o["length"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
+            )
+        }
+        sources.replaceScripts(list)
     }
 
     // ─── Event dispatch ───

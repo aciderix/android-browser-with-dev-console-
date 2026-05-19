@@ -576,9 +576,6 @@ class WebViewEngine : BrowserEngine {
           } catch(e){ emit('warn', 'viewport-fix injection failed: ' + e); }
 
           // ── DOM health snapshot, exposed as window.__devbrowser_snapshot() ─
-          // Manual rather than auto so the console isn't flooded on every
-          // page load. The native side calls this on demand from the snapshot
-          // button in the Console panel.
           function clean(s){ return (s||'').replace(/\s+/g, ' ').trim(); }
           window.__devbrowser_snapshot = function(label){
             try {
@@ -633,7 +630,244 @@ class WebViewEngine : BrowserEngine {
               return 'ok';
             } catch(e){ emit('error', 'snapshot failed: ' + e); return 'err:' + e; }
           };
-        })();
+
+          // ── DOM tree, exposed for the Elements panel ────────────────────
+          // Returns an object matching parseDomNode() shape on the native
+          // side. Caches DOM elements by an integer ID for follow-up calls
+          // (computed style, attribute edit, etc.). The cache is reset every
+          // call so the tree always reflects current DOM.
+          window.__devbrowser_node_map = {};
+          window.__devbrowser_dom_get = function(maxDepth){
+            maxDepth = maxDepth || 8;
+            var idCounter = 1;
+            window.__devbrowser_node_map = {};
+            function ser(node, depth){
+              var id = idCounter++;
+              window.__devbrowser_node_map[id] = node;
+              var attrs = [];
+              if (node.attributes) {
+                for (var i = 0; i < node.attributes.length; i++) {
+                  attrs.push(node.attributes[i].name);
+                  attrs.push(node.attributes[i].value);
+                }
+              }
+              var children = [];
+              var all = node.childNodes || [];
+              if (depth < maxDepth) {
+                for (var i = 0; i < all.length; i++) {
+                  var c = all[i];
+                  if (c.nodeType === 3 && (!c.nodeValue || !c.nodeValue.trim())) continue;
+                  children.push(ser(c, depth + 1));
+                }
+              }
+              return {
+                nodeId: id,
+                nodeType: node.nodeType,
+                nodeName: node.nodeName || '',
+                localName: node.localName || null,
+                nodeValue: node.nodeValue || null,
+                attributes: attrs,
+                children: children,
+                childNodeCount: all.length
+              };
+            }
+            return ser(document, 0);
+          };
+
+          window.__devbrowser_computed_style = function(nodeId){
+            var el = window.__devbrowser_node_map[nodeId];
+            if (!el || el.nodeType !== 1) return [];
+            var cs = getComputedStyle(el);
+            var out = [];
+            for (var i = 0; i < cs.length; i++) {
+              var name = cs[i];
+              out.push({ name: name, value: cs.getPropertyValue(name) });
+            }
+            return out;
+          };
+
+          window.__devbrowser_set_attr = function(nodeId, name, value){
+            var el = window.__devbrowser_node_map[nodeId];
+            if (!el || el.nodeType !== 1) return 'not-found';
+            el.setAttribute(name, value);
+            return 'ok';
+          };
+
+          window.__devbrowser_highlight = function(nodeId){
+            var el = window.__devbrowser_node_map[nodeId];
+            if (!el || el.nodeType !== 1) return;
+            try {
+              var prev = el.style.outline;
+              var prevBg = el.style.backgroundColor;
+              el.style.outline = '2px solid #60A5FA';
+              el.style.backgroundColor = 'rgba(96,165,250,0.15)';
+              setTimeout(function(){
+                el.style.outline = prev;
+                el.style.backgroundColor = prevBg;
+              }, 1200);
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } catch(e){}
+          };
+
+          // Touch-based element picker. Calling __devbrowser_pick_start()
+          // installs a one-shot click listener that resolves to the picked
+          // node's CSS path. The native side calls __devbrowser_pick_stop()
+          // to cancel. Picked node ID is logged via emit('info', '__pick__:N').
+          var __pickActive = false;
+          var __pickOverlay = null;
+          var __pickHandler = null;
+          window.__devbrowser_pick_start = function(){
+            if (__pickActive) return;
+            __pickActive = true;
+            __pickOverlay = document.createElement('div');
+            __pickOverlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;' +
+              'border:2px solid #60A5FA;background:rgba(96,165,250,0.15);' +
+              'transition:all 60ms ease;top:0;left:0;width:0;height:0;';
+            document.documentElement.appendChild(__pickOverlay);
+            function move(ev){
+              var t = ev.touches ? ev.touches[0] : ev;
+              if (!t) return;
+              var el = document.elementFromPoint(t.clientX, t.clientY);
+              if (!el || el === __pickOverlay) return;
+              var r = el.getBoundingClientRect();
+              __pickOverlay.style.left = r.left + 'px';
+              __pickOverlay.style.top = r.top + 'px';
+              __pickOverlay.style.width = r.width + 'px';
+              __pickOverlay.style.height = r.height + 'px';
+              __pickOverlay.__target = el;
+            }
+            function pick(ev){
+              ev.preventDefault();
+              ev.stopPropagation();
+              var el = __pickOverlay && __pickOverlay.__target;
+              if (el) {
+                // Look up id in current node map, or rebuild + search.
+                var foundId = null;
+                var map = window.__devbrowser_node_map;
+                for (var k in map) if (map[k] === el) { foundId = k; break; }
+                emit('info', '__pick__:' + (foundId || '0') + ':' + el.tagName.toLowerCase());
+              }
+              window.__devbrowser_pick_stop();
+            }
+            __pickHandler = { move: move, pick: pick };
+            document.addEventListener('touchmove', move, true);
+            document.addEventListener('touchstart', move, true);
+            document.addEventListener('click', pick, true);
+            return 'ok';
+          };
+          window.__devbrowser_pick_stop = function(){
+            __pickActive = false;
+            if (__pickOverlay) { try { __pickOverlay.remove(); } catch(e){} __pickOverlay = null; }
+            if (__pickHandler) {
+              document.removeEventListener('touchmove', __pickHandler.move, true);
+              document.removeEventListener('touchstart', __pickHandler.move, true);
+              document.removeEventListener('click', __pickHandler.pick, true);
+              __pickHandler = null;
+            }
+            return 'ok';
+          };
+
+          // ── Scripts list for the Sources panel ──────────────────────────
+          window.__devbrowser_get_scripts = function(){
+            var scripts = document.scripts;
+            var out = [];
+            for (var i = 0; i < scripts.length; i++) {
+              var s = scripts[i];
+              out.push({
+                scriptId: 's' + i,
+                url: s.src || ('inline-' + i),
+                isModule: s.type === 'module',
+                length: s.src ? 0 : (s.textContent || '').length,
+                inlineContent: s.src ? null : (s.textContent || '').slice(0, 65536)
+              });
+            }
+            return out;
+          };
+          window.__devbrowser_get_script_source = function(scriptId){
+            // Returns inline source or null. For external scripts, native side
+            // must fetch via the URL.
+            if (typeof scriptId !== 'string' || scriptId.indexOf('s') !== 0) return null;
+            var idx = parseInt(scriptId.slice(1), 10);
+            var s = document.scripts[idx];
+            if (!s) return null;
+            if (s.src) return null; // external — caller fetches
+            return s.textContent || '';
+          };
+
+          // ── Storage for the Application panel ───────────────────────────
+          window.__devbrowser_get_storage = function(){
+            var cookies = [];
+            try {
+              if (document.cookie) {
+                var parts = document.cookie.split(';');
+                for (var i = 0; i < parts.length; i++) {
+                  var p = parts[i];
+                  var eq = p.indexOf('=');
+                  var name = (eq >= 0 ? p.slice(0, eq) : p).trim();
+                  var value = (eq >= 0 ? p.slice(eq + 1) : '').trim();
+                  if (name) cookies.push({
+                    name: name, value: value,
+                    domain: location.hostname, path: '/',
+                    expires: null, secure: location.protocol === 'https:',
+                    httpOnly: false, sameSite: null
+                  });
+                }
+              }
+            } catch(e){}
+            function dump(storage){
+              var items = [];
+              try {
+                for (var i = 0; i < storage.length; i++) {
+                  var k = storage.key(i);
+                  items.push({ key: k, value: storage.getItem(k) || '' });
+                }
+              } catch(e){}
+              return items;
+            }
+            return {
+              origin: location.origin,
+              cookies: cookies,
+              localStorage: dump(window.localStorage),
+              sessionStorage: dump(window.sessionStorage)
+            };
+          };
+          window.__devbrowser_delete_cookie = function(name){
+            try {
+              document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+              document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; domain=' + location.hostname;
+              return 'ok';
+            } catch(e){ return 'err:' + e; }
+          };
+
+          // ── Performance / Memory metrics ────────────────────────────────
+          window.__devbrowser_get_perf = function(){
+            var metrics = [];
+            try {
+              if (performance.memory) {
+                metrics.push({ name: 'JSHeapUsedSize', value: performance.memory.usedJSHeapSize });
+                metrics.push({ name: 'JSHeapTotalSize', value: performance.memory.totalJSHeapSize });
+                metrics.push({ name: 'JSHeapSizeLimit', value: performance.memory.jsHeapSizeLimit });
+              }
+              metrics.push({ name: 'Nodes', value: document.querySelectorAll('*').length });
+              metrics.push({ name: 'Listeners', value: -1 });
+              metrics.push({ name: 'Timestamp', value: performance.now() / 1000 });
+              var paints = performance.getEntriesByType('paint') || [];
+              for (var i = 0; i < paints.length; i++) {
+                metrics.push({
+                  name: paints[i].name === 'first-paint' ? 'FirstPaint' : 'FirstContentfulPaint',
+                  value: paints[i].startTime
+                });
+              }
+              var nav = performance.getEntriesByType('navigation') || [];
+              if (nav[0]) {
+                metrics.push({ name: 'DomContentLoaded', value: nav[0].domContentLoadedEventEnd });
+                metrics.push({ name: 'LoadEvent', value: nav[0].loadEventEnd });
+                metrics.push({ name: 'DomComplete', value: nav[0].domComplete });
+                metrics.push({ name: 'ResponseEnd', value: nav[0].responseEnd });
+              }
+            } catch(e){ emit('warn', 'perf-get failed: ' + e); }
+            return metrics;
+          };
         """.trimIndent()
     }
 }
