@@ -534,28 +534,56 @@ class WebViewEngine : BrowserEngine {
           }
 
           // ── Viewport / layout compat patch ──────────────────────────────
-          // Tailwind h-screen (100vh) sometimes evaluates to 0 in Android
-          // WebView inside a Compose AndroidView, causing SPAs to render in a
-          // zero-height container that hides everything via overflow:hidden.
-          // The fix is universal: force html/body to fill the viewport and
-          // give common SPA mount points a sensible min-height.
+          // Tailwind h-screen (height: 100vh) — and 100dvh — sometimes
+          // evaluate to 0 inside the Compose AndroidView+WebView stack on
+          // Samsung's Chromium build, even though window.innerHeight is the
+          // correct value. That collapses #root, and overflow:hidden makes
+          // the SPA invisible. Two-step universal fix:
+          //   (a) Force html / body to an explicit pixel height (re-applied
+          //       on resize, orientationchange, and at T+0/100/500ms to
+          //       catch late layout) so percent-based heights chain works.
+          //   (b) Inject CSS that overrides common SPA mount points to
+          //       min-height: 100% (which is now the explicit body pixel
+          //       value, NOT 100vh which is broken).
           try {
             var style = document.createElement('style');
             style.setAttribute('data-devbrowser','viewport-fix');
             style.textContent =
-              'html,body{min-height:100%;height:100%;}' +
-              '#root,#app,#main,#__next,#__nuxt{min-height:100vh;min-height:100dvh;}';
-            if (document.head) document.head.appendChild(style);
-            else {
-              // head not built yet, wait for it
+              '#root,#app,#main,#__next,#__nuxt{min-height:100% !important;}';
+            function attachStyle(){
+              if (style.parentNode) return;
+              if (document.head) document.head.insertBefore(style, document.head.firstChild);
+              else if (document.documentElement) document.documentElement.appendChild(style);
+            }
+            attachStyle();
+            if (!document.head) {
               var obs = new MutationObserver(function(){
-                if (document.head) {
-                  document.head.appendChild(style);
-                  obs.disconnect();
-                }
+                attachStyle();
+                if (document.head) obs.disconnect();
               });
               obs.observe(document.documentElement, {childList: true, subtree: true});
             }
+
+            function fixViewport(){
+              var h = window.innerHeight || document.documentElement.clientHeight || 0;
+              if (!h) return;
+              try {
+                document.documentElement.style.height = h + 'px';
+                document.documentElement.style.minHeight = h + 'px';
+              } catch(e){}
+              if (document.body) {
+                try {
+                  document.body.style.height = h + 'px';
+                  document.body.style.minHeight = h + 'px';
+                } catch(e){}
+              }
+            }
+            fixViewport();
+            window.addEventListener('resize', fixViewport);
+            window.addEventListener('orientationchange', fixViewport);
+            setTimeout(fixViewport, 100);
+            setTimeout(fixViewport, 500);
+            setTimeout(fixViewport, 1500);
           } catch(e){ emit('warn', 'viewport-fix injection failed: ' + e); }
 
           // ── DOM health checks ───────────────────────────────────────────
@@ -572,11 +600,14 @@ class WebViewEngine : BrowserEngine {
                 found = { id: document.body.children[0].tagName.toLowerCase(), el: document.body.children[0] };
               }
               var body = document.body;
+              var htmlH = document.documentElement ? getComputedStyle(document.documentElement).height : '?';
+              var bodyH = body ? getComputedStyle(body).height : '?';
               var info = label + ': readyState=' + document.readyState +
                 ', title="' + document.title + '"' +
+                ', viewport=' + window.innerWidth + 'x' + window.innerHeight +
+                ', htmlHeight=' + htmlH + ', bodyHeight=' + bodyH +
                 ', bodyChildren=' + (body ? body.children.length : 0) +
                 ', bodyTextLen=' + (body ? (body.innerText||'').length : 0) +
-                ', viewport=' + window.innerWidth + 'x' + window.innerHeight +
                 ', buttons=' + document.querySelectorAll('button,[role=button]').length +
                 ', inputs=' + document.querySelectorAll('input,select,textarea').length +
                 ', forms=' + document.querySelectorAll('form').length;
