@@ -112,9 +112,7 @@ class WebViewEngine : BrowserEngine {
             }
 
             webViewClient = object : WebViewClient() {
-                private var pageStartMs: Long = 0L
                 override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                    pageStartMs = System.currentTimeMillis()
                     _state.value = _state.value.copy(
                         url = url,
                         isLoading = true,
@@ -122,14 +120,7 @@ class WebViewEngine : BrowserEngine {
                         canGoBack = view.canGoBack(),
                         canGoForward = view.canGoForward(),
                     )
-                    _nativeEvents.tryEmit(
-                        NativeEvent.Console(
-                            NativeEvent.Console.Level.Info,
-                            "→ Loading: $url",
-                            url, null,
-                        )
-                    )
-                    // On older webview builds without DOCUMENT_START_SCRIPT, inject
+                    // Older WebView builds without DOCUMENT_START_SCRIPT — inject
                     // the shim manually as soon as the document begins parsing.
                     if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                         view.evaluateJavascript(DBG_SHIM_JS, null)
@@ -145,27 +136,20 @@ class WebViewEngine : BrowserEngine {
                         canGoBack = view.canGoBack(),
                         canGoForward = view.canGoForward(),
                     )
-                    val dt = if (pageStartMs > 0) (System.currentTimeMillis() - pageStartMs) else 0L
-                    _nativeEvents.tryEmit(
-                        NativeEvent.Console(
-                            NativeEvent.Console.Level.Info,
-                            "✓ Loaded: $url (${dt} ms)",
-                            url, null,
-                        )
-                    )
-                    // Self-test: confirm the JS bridge is actually exposed.
+                    // Bridge self-test: silent on success, error log on failure.
                     view.evaluateJavascript(
                         "(typeof window.__devbrowser_dbg !== 'undefined') ? 'true:' + window.__devbrowser_dbg.ping() : 'false'"
                     ) { result ->
-                        val ok = result?.contains("true:pong") == true
-                        _nativeEvents.tryEmit(
-                            NativeEvent.Console(
-                                if (ok) NativeEvent.Console.Level.Debug else NativeEvent.Console.Level.Error,
-                                if (ok) "JS shim bridge online (window.__devbrowser_dbg.ping() → pong)"
-                                else "JS shim bridge NOT exposed (result=$result). Console capture limited.",
-                                null, null,
+                        if (result?.contains("true:pong") != true) {
+                            _nativeEvents.tryEmit(
+                                NativeEvent.Console(
+                                    NativeEvent.Console.Level.Error,
+                                    "JS shim bridge not exposed on this page (result=$result). " +
+                                        "Console capture limited to native events.",
+                                    null, null,
+                                )
                             )
-                        )
+                        }
                     }
                 }
 
@@ -442,6 +426,8 @@ class WebViewEngine : BrowserEngine {
           }
 
           // ── fetch hook ──────────────────────────────────────────────────
+          // Successful traffic is routed to the Network panel only — no console
+          // noise. Console gets only failures.
           if (window.fetch) {
             var _fetch = window.fetch.bind(window);
             window.fetch = function(input, init){
@@ -451,16 +437,14 @@ class WebViewEngine : BrowserEngine {
               var t0 = Date.now();
               var id = nextId();
               netStart(id, 'fetch', method, url);
-              emit('debug', '↗ fetch ' + method + ' ' + url);
               return _fetch(input, init).then(function(resp){
                 var dt = Date.now()-t0;
                 netEnd(id, 'fetch', method, url, resp.status, dt);
-                emit(resp.ok ? 'debug' : 'warn',
-                  '↙ fetch ' + resp.status + ' ' + url + ' (' + dt + 'ms)');
+                if (!resp.ok) emit('warn', 'fetch ' + resp.status + ' ' + url);
                 return resp;
               }, function(err){
                 netFail(id, 'fetch', method, url, (err && err.message) || String(err));
-                emit('error', '✗ fetch FAILED ' + url + ': ' + (err && err.message));
+                emit('error', 'fetch FAILED ' + url + ': ' + (err && err.message));
                 throw err;
               });
             };
@@ -480,20 +464,18 @@ class WebViewEngine : BrowserEngine {
               m.t0 = Date.now();
               var self = this;
               netStart(m.id, 'xhr', m.method||'GET', m.url||'');
-              emit('debug', '↗ xhr ' + (m.method||'GET') + ' ' + (m.url||''));
               this.addEventListener('load', function(){
                 var dt = Date.now()-m.t0;
                 netEnd(m.id, 'xhr', m.method||'GET', m.url||'', self.status, dt);
-                emit(self.status >= 400 ? 'warn' : 'debug',
-                  '↙ xhr ' + self.status + ' ' + (m.url||'') + ' (' + dt + 'ms)');
+                if (self.status >= 400) emit('warn', 'xhr ' + self.status + ' ' + (m.url||''));
               });
               this.addEventListener('error', function(){
                 netFail(m.id, 'xhr', m.method||'GET', m.url||'', 'network error');
-                emit('error', '✗ xhr FAILED ' + (m.url||''));
+                emit('error', 'xhr FAILED ' + (m.url||''));
               });
               this.addEventListener('timeout', function(){
                 netFail(m.id, 'xhr', m.method||'GET', m.url||'', 'timeout');
-                emit('error', '⏱ xhr TIMEOUT ' + (m.url||''));
+                emit('error', 'xhr TIMEOUT ' + (m.url||''));
               });
               return _send.apply(this, arguments);
             };
@@ -505,20 +487,20 @@ class WebViewEngine : BrowserEngine {
             var WSWrapper = function(url, protocols){
               var id = nextId();
               netStart(id, 'ws', 'WS', url);
-              emit('debug', '↗ ws connect ' + url);
               var t0 = Date.now();
               var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
               ws.addEventListener('open', function(){
                 netEnd(id, 'ws', 'WS', url, 101, Date.now()-t0);
-                emit('info', '✓ ws open ' + url);
               });
               ws.addEventListener('close', function(ev){
                 netEnd(id, 'ws', 'WS', url, ev.code, Date.now()-t0);
-                emit('debug', '✕ ws close ' + url + ' (code=' + ev.code + ' reason="' + (ev.reason||'') + '")');
+                if (ev.code >= 4000 || (ev.code !== 1000 && ev.code !== 1001))
+                  emit('warn', 'ws closed ' + ev.code + ' ' + url +
+                       (ev.reason ? ' (' + ev.reason + ')' : ''));
               });
               ws.addEventListener('error', function(){
                 netFail(id, 'ws', 'WS', url, 'ws error');
-                emit('error', '✗ ws error ' + url);
+                emit('error', 'ws error ' + url);
               });
               return ws;
             };
@@ -530,7 +512,7 @@ class WebViewEngine : BrowserEngine {
               WSWrapper.CLOSED = _WS.CLOSED;
               Object.defineProperty(window, 'WebSocket',
                 { value: WSWrapper, writable: true, configurable: true });
-            } catch(e){ emit('warn', 'WebSocket hook install failed: ' + e); }
+            } catch(e){ /* silent */ }
           }
 
           // ── Viewport / layout compat patch ──────────────────────────────
@@ -593,9 +575,12 @@ class WebViewEngine : BrowserEngine {
             setTimeout(fixViewport, 1500);
           } catch(e){ emit('warn', 'viewport-fix injection failed: ' + e); }
 
-          // ── DOM health checks ───────────────────────────────────────────
+          // ── DOM health snapshot, exposed as window.__devbrowser_snapshot() ─
+          // Manual rather than auto so the console isn't flooded on every
+          // page load. The native side calls this on demand from the snapshot
+          // button in the Console panel.
           function clean(s){ return (s||'').replace(/\s+/g, ' ').trim(); }
-          function snapshot(label){
+          window.__devbrowser_snapshot = function(label){
             try {
               var roots = ['root','app','main','__next','__nuxt'];
               var found = null;
@@ -609,7 +594,7 @@ class WebViewEngine : BrowserEngine {
               var body = document.body;
               var htmlH = document.documentElement ? getComputedStyle(document.documentElement).height : '?';
               var bodyH = body ? getComputedStyle(body).height : '?';
-              var info = label + ': readyState=' + document.readyState +
+              var info = (label || 'snapshot') + ': readyState=' + document.readyState +
                 ', title="' + document.title + '"' +
                 ', viewport=' + window.innerWidth + 'x' + window.innerHeight +
                 ', htmlHeight=' + htmlH + ', bodyHeight=' + bodyH +
@@ -629,10 +614,8 @@ class WebViewEngine : BrowserEngine {
                   ', opacity=' + cs.opacity + ', color=' + cs.color + ', bg=' + cs.backgroundColor + '}';
                 var txt = clean(found.el.innerText);
                 if (txt) info += '\n  innerText[0..400]="' + txt.substring(0, 400) + '"';
-                else info += '\n  innerText=(empty)';
                 var html = clean(found.el.innerHTML);
                 info += '\n  innerHTML[0..500]="' + html.substring(0, 500) + (html.length > 500 ? '…' : '') + '"';
-                // Walk first 5 visible children and report basics.
                 var kids = Array.prototype.slice.call(found.el.querySelectorAll('*')).slice(0, 8);
                 kids.forEach(function(k, idx){
                   var r = k.getBoundingClientRect();
@@ -647,11 +630,9 @@ class WebViewEngine : BrowserEngine {
                 info += '\nNO MOUNT POINT FOUND';
               }
               emit('info', info);
-            } catch(e){ emit('error', 'snapshot failed: ' + e); }
-          }
-          setTimeout(function(){ snapshot('⏱ T+1s'); }, 1000);
-          setTimeout(function(){ snapshot('⏱ T+3s'); }, 3000);
-          setTimeout(function(){ snapshot('⏱ T+8s'); }, 8000);
+              return 'ok';
+            } catch(e){ emit('error', 'snapshot failed: ' + e); return 'err:' + e; }
+          };
         })();
         """.trimIndent()
     }

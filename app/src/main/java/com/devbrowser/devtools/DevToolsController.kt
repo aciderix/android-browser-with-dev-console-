@@ -81,14 +81,7 @@ class DevToolsController(
         if (endpoint == null) {
             _status.value = Status.Unsupported
             val report = (engine as? WebViewEngine)?.lastProbeReport?.value.orEmpty()
-            val reportLines = if (report.isEmpty()) "(no candidates probed)"
-            else report.joinToString("\n") { "  ${it.first} → ${it.second}" }
-            _diagnostics.value = "CDP unreachable. Tried ${report.size} sockets."
-            console.appendNative(
-                ConsoleEntry.Level.Warn,
-                "CDP unavailable. Native+shim fallback active. Probed sockets:\n$reportLines",
-                null, null,
-            )
+            _diagnostics.value = "CDP unreachable (${report.size} probes). Shim active."
             return
         }
         _diagnostics.value = "Connecting to ${endpoint.name}…"
@@ -102,11 +95,6 @@ class DevToolsController(
         }
         _status.value = Status.Connected
         _diagnostics.value = "CDP connected via ${endpoint.name}"
-        console.appendNative(
-            ConsoleEntry.Level.Info,
-            "DevBrowser DevTools attached via CDP (${endpoint.name})",
-            null, null,
-        )
 
         eventJob = scope.launch {
             client.events.collect { dispatch(it) }
@@ -252,6 +240,14 @@ class DevToolsController(
         } catch (e: Exception) { raw }
         console.appendEvalResult(text)
         return text
+    }
+
+    /** Trigger an on-demand DOM health snapshot via the JS shim. */
+    suspend fun snapshotPage() {
+        val engine = attachedEngine ?: return
+        engine.evaluateJs(
+            "(typeof __devbrowser_snapshot === 'function') ? __devbrowser_snapshot('manual') : 'shim-missing'"
+        )
     }
 
     private fun jsStringLiteral(s: String): String {
