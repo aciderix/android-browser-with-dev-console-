@@ -36,4 +36,36 @@ class DbgBridge(private val sink: MutableSharedFlow<NativeEvent>) {
 
     @JavascriptInterface
     fun ping(): String = "pong"
+
+    @JavascriptInterface
+    fun netStart(callId: String, transport: String, method: String, url: String) {
+        sink.tryEmit(
+            NativeEvent.NetworkCall(
+                callId = callId, transport = transport, method = method, url = url,
+                phase = NativeEvent.NetworkCall.Phase.Started,
+            )
+        )
+    }
+
+    @JavascriptInterface
+    fun netEnd(callId: String, transport: String, method: String, url: String, status: Int, durationMs: Int) {
+        sink.tryEmit(
+            NativeEvent.NetworkCall(
+                callId = callId, transport = transport, method = method, url = url,
+                phase = NativeEvent.NetworkCall.Phase.Completed,
+                status = status, durationMs = durationMs.toLong(),
+            )
+        )
+    }
+
+    @JavascriptInterface
+    fun netFail(callId: String, transport: String, method: String, url: String, errorText: String?) {
+        sink.tryEmit(
+            NativeEvent.NetworkCall(
+                callId = callId, transport = transport, method = method, url = url,
+                phase = NativeEvent.NetworkCall.Phase.Failed,
+                errorText = errorText,
+            )
+        )
+    }
 }

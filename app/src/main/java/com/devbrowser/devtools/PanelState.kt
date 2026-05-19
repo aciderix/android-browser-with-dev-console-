@@ -129,6 +129,31 @@ class NetworkState {
 
     fun clear() = _requests.update { emptyList() }
 
+    /** Insert a request started by the shim (no CDP path). */
+    fun onShimStart(id: String, transport: String, method: String, url: String) {
+        val entry = NetworkRequest(
+            requestId = id,
+            url = url,
+            method = method,
+            resourceType = transport,
+            startMs = System.currentTimeMillis().toDouble(),
+        )
+        _requests.update { it + entry }
+    }
+
+    fun onShimEnd(id: String, status: Int, durationMs: Long) {
+        update(id) {
+            it.copy(
+                status = status.takeIf { s -> s > 0 },
+                endMs = it.startMs + durationMs,
+            )
+        }
+    }
+
+    fun onShimFail(id: String, errorText: String?) {
+        update(id) { it.copy(failureText = errorText, endMs = System.currentTimeMillis().toDouble()) }
+    }
+
     fun onRequestWillBeSent(params: JsonObject) {
         val id = params["requestId"]?.jsonPrimitive?.content ?: return
         val req = params["request"]?.jsonObject ?: return

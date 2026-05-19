@@ -428,6 +428,19 @@ class WebViewEngine : BrowserEngine {
             emit('error', 'Unhandled rejection: ' + stringify(ev.reason));
           }, true);
 
+          // Helpers for the per-call bridge.
+          var __nextId = 1;
+          function nextId(){ return 'c' + (__nextId++); }
+          function netStart(id, transport, method, url){
+            try { var b = bridge(); if (b) b.netStart(id, transport, method, url); } catch(e){}
+          }
+          function netEnd(id, transport, method, url, status, dt){
+            try { var b = bridge(); if (b) b.netEnd(id, transport, method, url, status|0, dt|0); } catch(e){}
+          }
+          function netFail(id, transport, method, url, msg){
+            try { var b = bridge(); if (b) b.netFail(id, transport, method, url, msg || ''); } catch(e){}
+          }
+
           // ── fetch hook ──────────────────────────────────────────────────
           if (window.fetch) {
             var _fetch = window.fetch.bind(window);
@@ -436,12 +449,17 @@ class WebViewEngine : BrowserEngine {
                         (input && input.url) ? input.url : String(input);
               var method = (init && init.method) || (input && input.method) || 'GET';
               var t0 = Date.now();
+              var id = nextId();
+              netStart(id, 'fetch', method, url);
               emit('debug', '↗ fetch ' + method + ' ' + url);
               return _fetch(input, init).then(function(resp){
+                var dt = Date.now()-t0;
+                netEnd(id, 'fetch', method, url, resp.status, dt);
                 emit(resp.ok ? 'debug' : 'warn',
-                  '↙ fetch ' + resp.status + ' ' + url + ' (' + (Date.now()-t0) + 'ms)');
+                  '↙ fetch ' + resp.status + ' ' + url + ' (' + dt + 'ms)');
                 return resp;
               }, function(err){
+                netFail(id, 'fetch', method, url, (err && err.message) || String(err));
                 emit('error', '✗ fetch FAILED ' + url + ': ' + (err && err.message));
                 throw err;
               });
@@ -454,22 +472,27 @@ class WebViewEngine : BrowserEngine {
             var _open = XHR.prototype.open;
             var _send = XHR.prototype.send;
             XHR.prototype.open = function(method, url){
-              this.__dbg_meta = { method: method, url: url, t0: 0 };
+              this.__dbg_meta = { method: method, url: url, t0: 0, id: nextId() };
               return _open.apply(this, arguments);
             };
             XHR.prototype.send = function(){
               var m = this.__dbg_meta || {};
               m.t0 = Date.now();
               var self = this;
+              netStart(m.id, 'xhr', m.method||'GET', m.url||'');
               emit('debug', '↗ xhr ' + (m.method||'GET') + ' ' + (m.url||''));
               this.addEventListener('load', function(){
+                var dt = Date.now()-m.t0;
+                netEnd(m.id, 'xhr', m.method||'GET', m.url||'', self.status, dt);
                 emit(self.status >= 400 ? 'warn' : 'debug',
-                  '↙ xhr ' + self.status + ' ' + (m.url||'') + ' (' + (Date.now()-m.t0) + 'ms)');
+                  '↙ xhr ' + self.status + ' ' + (m.url||'') + ' (' + dt + 'ms)');
               });
               this.addEventListener('error', function(){
+                netFail(m.id, 'xhr', m.method||'GET', m.url||'', 'network error');
                 emit('error', '✗ xhr FAILED ' + (m.url||''));
               });
               this.addEventListener('timeout', function(){
+                netFail(m.id, 'xhr', m.method||'GET', m.url||'', 'timeout');
                 emit('error', '⏱ xhr TIMEOUT ' + (m.url||''));
               });
               return _send.apply(this, arguments);
@@ -479,19 +502,35 @@ class WebViewEngine : BrowserEngine {
           // ── WebSocket hook ──────────────────────────────────────────────
           if (window.WebSocket) {
             var _WS = window.WebSocket;
-            window.WebSocket = function(url, protocols){
+            var WSWrapper = function(url, protocols){
+              var id = nextId();
+              netStart(id, 'ws', 'WS', url);
               emit('debug', '↗ ws connect ' + url);
+              var t0 = Date.now();
               var ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
-              ws.addEventListener('open', function(){ emit('info', '✓ ws open ' + url); });
-              ws.addEventListener('close', function(ev){ emit('debug', '✕ ws close ' + url + ' (code=' + ev.code + ' reason="' + (ev.reason||'') + '")'); });
-              ws.addEventListener('error', function(){ emit('error', '✗ ws error ' + url); });
+              ws.addEventListener('open', function(){
+                netEnd(id, 'ws', 'WS', url, 101, Date.now()-t0);
+                emit('info', '✓ ws open ' + url);
+              });
+              ws.addEventListener('close', function(ev){
+                netEnd(id, 'ws', 'WS', url, ev.code, Date.now()-t0);
+                emit('debug', '✕ ws close ' + url + ' (code=' + ev.code + ' reason="' + (ev.reason||'') + '")');
+              });
+              ws.addEventListener('error', function(){
+                netFail(id, 'ws', 'WS', url, 'ws error');
+                emit('error', '✗ ws error ' + url);
+              });
               return ws;
             };
-            window.WebSocket.prototype = _WS.prototype;
-            window.WebSocket.CONNECTING = 0;
-            window.WebSocket.OPEN = 1;
-            window.WebSocket.CLOSING = 2;
-            window.WebSocket.CLOSED = 3;
+            try {
+              WSWrapper.prototype = _WS.prototype;
+              WSWrapper.CONNECTING = _WS.CONNECTING;
+              WSWrapper.OPEN = _WS.OPEN;
+              WSWrapper.CLOSING = _WS.CLOSING;
+              WSWrapper.CLOSED = _WS.CLOSED;
+              Object.defineProperty(window, 'WebSocket',
+                { value: WSWrapper, writable: true, configurable: true });
+            } catch(e){ emit('warn', 'WebSocket hook install failed: ' + e); }
           }
 
           // ── Viewport / layout compat patch ──────────────────────────────

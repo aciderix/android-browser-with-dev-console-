@@ -62,6 +62,25 @@ sealed class NativeEvent {
         val statusCode: Int,
         val description: String,
     ) : NativeEvent()
+
+    /**
+     * Network call observed by the JS shim. transport is "fetch", "xhr"
+     * or "ws". status -1 means no response yet (still pending or failed
+     * before response). durationMs -1 means unfinished. Used to populate
+     * the Network panel when CDP isn't available.
+     */
+    data class NetworkCall(
+        val callId: String,
+        val transport: String,
+        val method: String,
+        val url: String,
+        val phase: Phase,
+        val status: Int = -1,
+        val durationMs: Long = -1,
+        val errorText: String? = null,
+    ) : NativeEvent() {
+        enum class Phase { Started, Completed, Failed }
+    }
 }
 
 data class EngineState(

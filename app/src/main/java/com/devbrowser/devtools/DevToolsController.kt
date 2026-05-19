@@ -146,6 +146,20 @@ class DevToolsController(
 
     private fun onNativeEvent(event: NativeEvent) {
         when (event) {
+            is NativeEvent.NetworkCall -> {
+                // When CDP's Network domain is delivering events, don't
+                // double-count the shim view. Without CDP, the shim is the
+                // sole source for the Network panel.
+                if (_status.value == Status.Connected) return
+                when (event.phase) {
+                    NativeEvent.NetworkCall.Phase.Started ->
+                        network.onShimStart(event.callId, event.transport, event.method, event.url)
+                    NativeEvent.NetworkCall.Phase.Completed ->
+                        network.onShimEnd(event.callId, event.status, event.durationMs)
+                    NativeEvent.NetworkCall.Phase.Failed ->
+                        network.onShimFail(event.callId, event.errorText)
+                }
+            }
             is NativeEvent.Console -> {
                 // Avoid duplicates: when CDP is delivering Runtime.consoleAPICalled
                 // already, skip the WebChromeClient mirror.
