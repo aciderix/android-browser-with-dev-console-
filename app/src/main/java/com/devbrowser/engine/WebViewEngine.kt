@@ -549,7 +549,14 @@ class WebViewEngine : BrowserEngine {
             var style = document.createElement('style');
             style.setAttribute('data-devbrowser','viewport-fix');
             style.textContent =
-              '#root,#app,#main,#__next,#__nuxt{min-height:100% !important;}';
+              '#root,#app,#main,#__next,#__nuxt{min-height:100% !important;}' +
+              // Tailwind viewport-relative height utilities: rewrite to %
+              // because 100vh (and dvh/lvh/svh) currently evaluate to 0 in
+              // this WebView. body now has a real pixel height (see below)
+              // so 100% chains correctly through any descendant.
+              '.h-screen,.h-dvh,.h-lvh,.h-svh{height:100% !important;}' +
+              '.min-h-screen,.min-h-dvh,.min-h-lvh,.min-h-svh{min-height:100% !important;}' +
+              '.max-h-screen,.max-h-dvh,.max-h-lvh,.max-h-svh{max-height:100% !important;}';
             function attachStyle(){
               if (style.parentNode) return;
               if (document.head) document.head.insertBefore(style, document.head.firstChild);
